@@ -2,7 +2,7 @@ import gradio as gr
 import requests
 import struct
 import json
-import re                          # [改动1] 新增：用于多模态层名过滤
+import re
 import numpy as np
 import torch
 from scipy.stats import pearsonr, spearmanr
@@ -32,11 +32,12 @@ except AttributeError:
 UNSUPPORTED_SVD_DTYPES = {"I8", "U8", "I32", "I64", "F8_E4M3", "F8_E5M2"}
 QUANTIZED_KEY_SIGNATURES = ["qweight", "qzeros", "scales", "g_idx", "packed_weight"]
 
-# [改动1] 多模态视觉层关键词 → 跳过这些层
+# 视觉层关键词（扩充）
 VISION_KEY_PATTERNS = [
     "vision", "visual", "image_encoder",
     "img_encoder", "patch_embed", "vit",
-    "vision_tower", "mm_projector",
+    "vision_tower", "vision_model",      # ★ 补充 gemma 的命名
+    "mm_projector", "multi_modal",
 ]
 
 
@@ -60,7 +61,6 @@ def read_safetensors_header(url: str, token: str = None) -> tuple[dict, int]:
     )
     r.raise_for_status()
     raw = json.loads(r.content)
-    # 过滤 __metadata__
     raw.pop("__metadata__", None)
     return raw, header_size
 
@@ -126,14 +126,114 @@ def _http_error_msg(e: requests.exceptions.HTTPError, model_id: str) -> str:
     return f"❌ HTTP {code}：{e}"
 
 
-# [改动1] 判断一个 key 是否属于视觉模态层
 def is_vision_key(key: str) -> bool:
     key_lower = key.lower()
     return any(pat in key_lower for pat in VISION_KEY_PATTERNS)
 
 
 # ─────────────────────────────────────────────
-# 量化三重检测（不变）
+# ★ 修复1：发现层时记录 key 完整路径，并区分模态
+# ─────────────────────────────────────────────
+
+def discover_layer_qkv_keys(all_shard_headers: dict) -> dict:
+    """
+    遍历所有 shard 的全部 keys，为每层归类 Q/K/V key。
+
+    返回结构：
+    {
+        (modality, layer_idx, prefix): {
+            "q": (shard, key),
+            "k": (shard, key),
+            "v": (shard, key),
+        }
+    }
+    其中 prefix 是 layers.{N} 之前的部分（如 "language_model.model."），
+    用来区分同时存在多套 layer 编号的情况（如 vision tower + language model）。
+    """
+    layer_map: dict[tuple, dict] = {}
+
+    for shard_name, (header, _) in all_shard_headers.items():
+        for key in header.keys():
+            # 必须是 weight，不要 bias / norm
+            if not key.endswith(".weight"):
+                continue
+
+            # 提取 layers.{N} 的位置
+            m = re.search(r'(.*?)layers\.(\d+)\.(.*)', key)
+            if not m:
+                continue
+            prefix    = m.group(1)         # e.g. "language_model.model."
+            layer_idx = int(m.group(2))
+            suffix    = m.group(3)         # e.g. "self_attn.q_proj.weight"
+
+            # ★ 关键：模态判断基于 prefix（不是整个 key）
+            modality = "vision" if is_vision_key(prefix) else "text"
+
+            # 识别 Q/K/V
+            qkv = None
+            if any(p in suffix for p in [
+                "q_proj.weight", "wq.weight",
+                "attention.query.weight",
+                "self_attn.q.weight", "attn.q.weight",
+            ]):
+                qkv = "q"
+            elif any(p in suffix for p in [
+                "k_proj.weight", "wk.weight",
+                "attention.key.weight",
+                "self_attn.k.weight", "attn.k.weight",
+            ]):
+                qkv = "k"
+            elif any(p in suffix for p in [
+                "v_proj.weight", "wv.weight",
+                "attention.value.weight",
+                "self_attn.v.weight", "attn.v.weight",
+            ]):
+                qkv = "v"
+            else:
+                continue
+
+            # ★ 用 (modality, prefix, layer_idx) 作为唯一键
+            uid = (modality, prefix, layer_idx)
+            if uid not in layer_map:
+                layer_map[uid] = {"q": None, "k": None, "v": None}
+
+            if layer_map[uid][qkv] is None:
+                layer_map[uid][qkv] = (shard_name, key)
+
+    return layer_map
+
+
+# ─────────────────────────────────────────────
+# Gemma4 等 config 兼容
+# ─────────────────────────────────────────────
+
+def extract_config_params(config: dict) -> dict:
+    if config is None:
+        return {}
+
+    text_cfg = config.get("text_config", {}) or {}
+
+    def get_field(*keys):
+        for k in keys:
+            v = config.get(k)
+            if v is not None:
+                return v
+            v = text_cfg.get(k)
+            if v is not None:
+                return v
+        return None
+
+    return {
+        "hidden_size":         get_field("hidden_size"),
+        "num_attention_heads": get_field("num_attention_heads"),
+        "num_key_value_heads": get_field("num_key_value_heads"),
+        "head_dim":            get_field("head_dim"),
+        "model_type":          get_field("model_type"),
+    }
+
+
+# ─────────────────────────────────────────────
+# 量化检测（不变）
 # ─────────────────────────────────────────────
 
 def check_quantization(model_id: str, token: str = None) -> tuple[bool, str]:
@@ -200,24 +300,28 @@ def check_quantization(model_id: str, token: str = None) -> tuple[bool, str]:
 
 
 # ─────────────────────────────────────────────
-# GQA 参数自动推断（不变）
+# GQA 推断
 # ─────────────────────────────────────────────
 
 def infer_gqa_params(
     W_q: torch.Tensor,
     W_k: torch.Tensor,
-    config: dict | None
+    config_params: dict | None,
+    modality: str = "text",
 ) -> tuple[int,int,int]:
     q_rows = W_q.shape[0]
     k_rows = W_k.shape[0]
 
     d_head = None
-    if config:
-        d_head = (
-            config.get("head_dim") or
-            config.get("kv_channels") or
-            config.get("hidden_size", 0) // max(config.get("num_attention_heads", 1), 1)
-        )
+
+    # ★ 视觉层不要用文本层的 head_dim
+    if config_params and modality == "text":
+        d_head = config_params.get("head_dim")
+        if not d_head:
+            nh = config_params.get("num_attention_heads") or 1
+            hs = config_params.get("hidden_size") or 0
+            if hs and nh:
+                d_head = hs // nh
         if d_head == 0:
             d_head = None
 
@@ -243,7 +347,7 @@ def infer_gqa_params(
 
 
 # ─────────────────────────────────────────────
-# [改动2] 指标计算函数：新增右奇异向量对齐
+# 指标计算
 # ─────────────────────────────────────────────
 
 def compute_pearson_corr(s_a: torch.Tensor, s_b: torch.Tensor) -> float:
@@ -281,12 +385,9 @@ def compute_ssr(s_a: torch.Tensor, s_b: torch.Tensor) -> float:
 def compute_left_vector_alignment(
     U_a: torch.Tensor, U_b: torch.Tensor
 ) -> float:
-    """
-    左奇异向量（输出子空间）对齐度：
-    cosU = mean_i |<u_a_i, u_b_i>|
-    对应第四定律：cos(Uq,Uk) ≈ 1/√d_head（随机正交）
-                  cos(Uq,Uv) < 1/√d_head（超正交）
-    """
+    # ★ 安全：行数（输出维度 d_head）必须相同才有意义
+    if U_a.shape[0] != U_b.shape[0]:
+        return float('nan')
     min_c = min(U_a.shape[1], U_b.shape[1])
     Ua = U_a[:, :min_c]
     Ub = U_b[:, :min_c]
@@ -295,16 +396,12 @@ def compute_left_vector_alignment(
     return float(torch.diag(torch.abs(Ua_n.T @ Ub_n)).mean())
 
 
-# [改动2] 新增：右奇异向量（输入子空间）对齐度
 def compute_right_vector_alignment(
     Vt_a: torch.Tensor, Vt_b: torch.Tensor
 ) -> float:
-    """
-    右奇异向量（输入子空间）对齐度：
-    cosV = mean_i |<v_a_i, v_b_i>|
-    对应第五定律：所有对之间 ≈ 1/√d_model（全局随机正交）
-    注意：SVD 返回 Vt（转置），每行是一个右奇异向量
-    """
+    # ★ 安全：列数（输入维度 d_model）必须相同才有意义
+    if Vt_a.shape[1] != Vt_b.shape[1]:
+        return float('nan')
     min_r = min(Vt_a.shape[0], Vt_b.shape[0])
     Va_n = Vt_a[:min_r, :]
     Vb_n = Vt_b[:min_r, :]
@@ -314,37 +411,38 @@ def compute_right_vector_alignment(
 
 
 # ─────────────────────────────────────────────
-# [改动3] 逐头分析：Q-K + Q-V + K-V 全指标
+# 逐头分析
 # ─────────────────────────────────────────────
 
 def analyze_layer_heads(
     W_q: torch.Tensor,
     W_k: torch.Tensor,
-    W_v: torch.Tensor,       # [改动3] 新增 W_v 输入
+    W_v: torch.Tensor,
     layer_idx: int,
     n_q_heads: int,
     n_kv_heads: int,
     d_head: int,
-    modality: str = "text",  # [改动4] 新增 modality 标记
+    modality: str = "text",
 ) -> tuple[list[dict], str]:
-    """
-    GQA 逐头全指标分析：
-    对每个 KV 头：
-      - 计算 K-V 对的全部指标（只算一次）
-      - 对组内每个 Q 头：计算 Q-K、Q-V 全部指标
-    """
+    # ★ 强一致性检查：Q/K/V 的输入维度必须一致
+    if W_q.shape[1] != W_k.shape[1] or W_k.shape[1] != W_v.shape[1]:
+        return [], (
+            f"\nLayer {layer_idx} [{modality}]: "
+            f"⚠️ Q/K/V 输入维度不一致 "
+            f"({W_q.shape}, {W_k.shape}, {W_v.shape})，跳过\n"
+        )
+
     group_size = n_q_heads // n_kv_heads
     records    = []
     log_lines  = []
 
     log_lines.append(
         f"\n{'─'*80}\n"
-        f"Layer {layer_idx:3d}  [{modality}]  "        # [改动4] 显示模态
+        f"Layer {layer_idx:3d}  [{modality}]  "
         f"n_q={n_q_heads} n_kv={n_kv_heads} "
         f"group={group_size} d_head={d_head}\n"
         f"{'─'*80}\n"
     )
-    # 表头
     log_lines.append(
         f"  {'KV':>3} {'Q':>3} │"
         f" {'P_QK':>7} {'Sp_QK':>7} {'SSR_QK':>8} │"
@@ -355,19 +453,16 @@ def analyze_layer_heads(
     )
 
     for kv_h in range(n_kv_heads):
-
-        # ── 提取 K / V 头矩阵 ─────────────────────────
         k_tensor = W_k[kv_h * d_head : (kv_h + 1) * d_head, :]
-        v_tensor = W_v[kv_h * d_head : (kv_h + 1) * d_head, :]  # [改动3]
+        v_tensor = W_v[kv_h * d_head : (kv_h + 1) * d_head, :]
 
         U_k, s_k, Vt_k = torch.linalg.svd(k_tensor, full_matrices=False)
-        U_v, s_v, Vt_v = torch.linalg.svd(v_tensor, full_matrices=False)  # [改动3]
+        U_v, s_v, Vt_v = torch.linalg.svd(v_tensor, full_matrices=False)
 
-        # ── K-V 指标（每个 KV 头只算一次）─────────────
-        alpha_kv,  alpha_res_kv  = compute_singular_value_ratio(s_k, s_v)
-        cosU_KV   = compute_left_vector_alignment(U_k, U_v)
-        cosV_KV   = compute_right_vector_alignment(Vt_k, Vt_v)   # [改动2]
-        ssr_kv    = compute_ssr(s_k, s_v)
+        alpha_kv, alpha_res_kv = compute_singular_value_ratio(s_k, s_v)
+        cosU_KV  = compute_left_vector_alignment(U_k, U_v)
+        cosV_KV  = compute_right_vector_alignment(Vt_k, Vt_v)
+        ssr_kv   = compute_ssr(s_k, s_v)
         pearson_kv = compute_pearson_corr(
             s_k[:min(s_k.shape[0], s_v.shape[0])],
             s_v[:min(s_k.shape[0], s_v.shape[0])]
@@ -381,25 +476,22 @@ def analyze_layer_heads(
             min_qk = min(s_q.shape[0], s_k.shape[0])
             min_qv = min(s_q.shape[0], s_v.shape[0])
 
-            # ── Q-K 指标 ──────────────────────────────
             pearson_qk  = compute_pearson_corr(s_q[:min_qk], s_k[:min_qk])
             spearman_qk = float(spearmanr(
                 s_q[:min_qk].cpu().numpy(),
                 s_k[:min_qk].cpu().numpy()
             )[0])
-            ssr_qk     = compute_ssr(s_q, s_k)
-            alpha_qk,  alpha_res_qk  = compute_singular_value_ratio(s_q, s_k)
-            cosU_QK    = compute_left_vector_alignment(U_q, U_k)
-            cosV_QK    = compute_right_vector_alignment(Vt_q, Vt_k)   # [改动2]
+            ssr_qk      = compute_ssr(s_q, s_k)
+            alpha_qk, alpha_res_qk = compute_singular_value_ratio(s_q, s_k)
+            cosU_QK     = compute_left_vector_alignment(U_q, U_k)
+            cosV_QK     = compute_right_vector_alignment(Vt_q, Vt_k)
 
-            # ── Q-V 指标 ──────────────────────────────  [改动3]
             pearson_qv  = compute_pearson_corr(s_q[:min_qv], s_v[:min_qv])
             ssr_qv      = compute_ssr(s_q, s_v)
-            alpha_qv,  alpha_res_qv  = compute_singular_value_ratio(s_q, s_v)
-            cosU_QV    = compute_left_vector_alignment(U_q, U_v)
-            cosV_QV    = compute_right_vector_alignment(Vt_q, Vt_v)   # [改动2]
+            alpha_qv, alpha_res_qv = compute_singular_value_ratio(s_q, s_v)
+            cosU_QV     = compute_left_vector_alignment(U_q, U_v)
+            cosV_QV     = compute_right_vector_alignment(Vt_q, Vt_v)
 
-            # ── 奇异值范围 ─────────────────────────────  [改动3]
             sig_max_q = float(s_q.max())
             sig_min_q = float(s_q[s_q > 1e-10].min()) if (s_q > 1e-10).any() else 0.0
             sig_max_k = float(s_k.max())
@@ -407,52 +499,43 @@ def analyze_layer_heads(
             sig_max_v = float(s_v.max())
             sig_min_v = float(s_v[s_v > 1e-10].min()) if (s_v > 1e-10).any() else 0.0
 
-            # 条件数（第三定律）
             cond_q = sig_max_q / (sig_min_q + 1e-10)
             cond_k = sig_max_k / (sig_min_k + 1e-10)
             cond_v = sig_max_v / (sig_min_v + 1e-10)
 
             records.append({
-                # 位置信息
-                "layer":          layer_idx,
-                "modality":       modality,          # [改动4]
-                "kv_head":        kv_h,
-                "q_head":         h_idx,
-                # 第一定律：谱线性对齐
-                "pearson_QK":     round(pearson_qk,   6),
-                "spearman_QK":    round(spearman_qk,  6),
-                "pearson_QV":     round(pearson_qv,   6),  # [改动3]
-                "pearson_KV":     round(pearson_kv,   6),  # [改动3]
-                # 第二定律：SSR
-                "ssr_QK":         round(ssr_qk,        8),
-                "ssr_QV":         round(ssr_qv,        8),  # [改动3]
-                "ssr_KV":         round(ssr_kv,        8),  # [改动3]
-                # 第四定律：左奇异向量（输出子空间）
-                "cosU_QK":        round(cosU_QK,       6),
-                "cosU_QV":        round(cosU_QV,       6),  # [改动3]
-                "cosU_KV":        round(cosU_KV,       6),  # [改动3]
-                # 第五定律：右奇异向量（输入子空间）[改动2]
-                "cosV_QK":        round(cosV_QK,       6),
-                "cosV_QV":        round(cosV_QV,       6),
-                "cosV_KV":        round(cosV_KV,       6),
-                # 尺度因子
-                "alpha_QK":       round(alpha_qk,      4),
-                "alpha_QV":       round(alpha_qv,      4),  # [改动3]
-                "alpha_KV":       round(alpha_kv,      4),  # [改动3]
-                "alpha_res_QK":   round(alpha_res_qk,  6),
-                "alpha_res_QV":   round(alpha_res_qv,  6),  # [改动3]
-                "alpha_res_KV":   round(alpha_res_kv,  6),  # [改动3]
-                # 奇异值范围 [改动3]
-                "sigma_max_Q":    round(sig_max_q, 4),
-                "sigma_min_Q":    round(sig_min_q, 4),
-                "sigma_max_K":    round(sig_max_k, 4),
-                "sigma_min_K":    round(sig_min_k, 4),
-                "sigma_max_V":    round(sig_max_v, 4),
-                "sigma_min_V":    round(sig_min_v, 4),
-                # 条件数（第三定律）[改动3]
-                "cond_Q":         round(cond_q, 2),
-                "cond_K":         round(cond_k, 2),
-                "cond_V":         round(cond_v, 2),
+                "layer":         layer_idx,
+                "modality":      modality,
+                "kv_head":       kv_h,
+                "q_head":        h_idx,
+                "pearson_QK":    round(pearson_qk,   6),
+                "spearman_QK":   round(spearman_qk,  6),
+                "pearson_QV":    round(pearson_qv,   6),
+                "pearson_KV":    round(pearson_kv,   6),
+                "ssr_QK":        round(ssr_qk,        8),
+                "ssr_QV":        round(ssr_qv,        8),
+                "ssr_KV":        round(ssr_kv,        8),
+                "cosU_QK":       round(cosU_QK,       6),
+                "cosU_QV":       round(cosU_QV,       6),
+                "cosU_KV":       round(cosU_KV,       6),
+                "cosV_QK":       round(cosV_QK,       6),
+                "cosV_QV":       round(cosV_QV,       6),
+                "cosV_KV":       round(cosV_KV,       6),
+                "alpha_QK":      round(alpha_qk,      4),
+                "alpha_QV":      round(alpha_qv,      4),
+                "alpha_KV":      round(alpha_kv,      4),
+                "alpha_res_QK":  round(alpha_res_qk,  6),
+                "alpha_res_QV":  round(alpha_res_qv,  6),
+                "alpha_res_KV":  round(alpha_res_kv,  6),
+                "sigma_max_Q":   round(sig_max_q, 4),
+                "sigma_min_Q":   round(sig_min_q, 4),
+                "sigma_max_K":   round(sig_max_k, 4),
+                "sigma_min_K":   round(sig_min_k, 4),
+                "sigma_max_V":   round(sig_max_v, 4),
+                "sigma_min_V":   round(sig_min_v, 4),
+                "cond_Q":        round(cond_q, 2),
+                "cond_K":        round(cond_k, 2),
+                "cond_V":        round(cond_v, 2),
             })
 
             log_lines.append(
@@ -492,7 +575,7 @@ def analyze_model(
         return "".join(log_lines), None
 
     # ── config.json ───────────────────────────────
-    config = None
+    config_params = {}
     try:
         r = requests.get(
             f"https://huggingface.co/{model_id}/resolve/main/config.json",
@@ -500,162 +583,151 @@ def analyze_model(
             timeout=15
         )
         if r.status_code == 200:
-            config = r.json()
+            raw_config    = r.json()
+            config_params = extract_config_params(raw_config)
             log_lines.append(
                 f"📋 config.json：\n"
-                f"   model_type          = {config.get('model_type')}\n"
-                f"   hidden_size         = {config.get('hidden_size')}\n"
-                f"   num_attention_heads = {config.get('num_attention_heads')}\n"
-                f"   num_key_value_heads = {config.get('num_key_value_heads')}\n"
-                f"   head_dim            = {config.get('head_dim')}\n"
+                f"   model_type          = {config_params.get('model_type')}\n"
+                f"   hidden_size (text)  = {config_params.get('hidden_size')}\n"
+                f"   num_attention_heads = {config_params.get('num_attention_heads')}\n"
+                f"   num_key_value_heads = {config_params.get('num_key_value_heads')}\n"
+                f"   head_dim            = {config_params.get('head_dim')}\n"
                 f"{'─'*80}\n"
             )
     except Exception:
         log_lines.append("⚠️  无法读取 config.json，将从 weight shape 自动推断\n")
 
-    # ── 分片索引 ──────────────────────────────────
+    # ── shard 列表 ────────────────────────────────
     progress(0.05, desc="读取模型索引...")
     try:
-        index_data    = find_index_file(model_id, token)
-        shard_headers: dict[str, tuple[dict, int]] = {}
-
+        index_data = find_index_file(model_id, token)
         if index_data:
-            weight_map = index_data["weight_map"]
+            shard_files = sorted(set(index_data["weight_map"].values()))
             log_lines.append(
-                f"📦 分片模型，共 {len(set(weight_map.values()))} 个 shard\n"
+                f"📦 分片模型，共 {len(shard_files)} 个 shard\n"
             )
         else:
-            sf_files   = get_safetensor_files(model_id, token)
-            weight_map = None
-            log_lines.append(f"📦 单文件：{sf_files}\n")
+            shard_files = get_safetensor_files(model_id, token)
+            log_lines.append(f"📦 单/多文件：{shard_files}\n")
     except requests.exceptions.HTTPError as e:
         return _http_error_msg(e, model_id), None
 
-    # ── 探测第一个 shard ──────────────────────────
-    progress(0.08, desc="识别层结构...")
-    try:
-        if index_data:
-            first_shard = sorted(set(index_data["weight_map"].values()))[0]
-        else:
-            first_shard = sf_files[0]
-        first_url = get_file_url(model_id, first_shard)
-        first_header, first_hsize = read_safetensors_header(first_url, token)
-        shard_headers[first_shard] = (first_header, first_hsize)
-        all_keys = list(first_header.keys())
-    except Exception as e:
-        return f"❌ 读取 shard header 失败：{e}", None
+    # ── 读取所有 shard headers ────────────────────
+    progress(0.08, desc="读取所有 shard headers...")
+    all_shard_headers: dict[str, tuple[dict, int]] = {}
+    total_keys = 0
+    for shard in shard_files:
+        try:
+            url = get_file_url(model_id, shard)
+            h, hs = read_safetensors_header(url, token)
+            all_shard_headers[shard] = (h, hs)
+            total_keys += len(h)
+        except Exception as e:
+            log_lines.append(f"⚠️  读取 {shard} header 失败：{e}\n")
 
-    # [改动1] 区分文本层 key 和视觉层 key
-    text_keys   = [k for k in all_keys if not is_vision_key(k)]
-    vision_keys = [k for k in all_keys if is_vision_key(k)]
-    log_lines.append(
-        f"🔑 总 key 数：{len(all_keys)}  "
-        f"（文本层：{len(text_keys)}，视觉层跳过：{len(vision_keys)}）\n"
-    )
+    # ── 发现层（区分模态）─────────────────────────
+    progress(0.12, desc="识别层结构...")
+    layer_map = discover_layer_qkv_keys(all_shard_headers)
 
-    # 识别 Q/K/V key 命名规则（只在文本 key 中识别）
-    q_candidates = [k for k in text_keys if any(
-        p in k for p in ["q_proj.weight","query.weight","q.weight","wq.weight"]
-    )]
-    if not q_candidates:
-        sample = "\n".join(text_keys[:30])
-        return f"⚠️ 无法识别文本层 Q/K/V key，前 30 个文本 key：\n{sample}", None
+    # ★ 统计每个 (modality, prefix) 的层数
+    groups: dict[tuple, list[int]] = {}
+    for (modality, prefix, layer_idx), _ in layer_map.items():
+        groups.setdefault((modality, prefix), []).append(layer_idx)
 
-    sample_q = q_candidates[0]
-    if   "q_proj"  in sample_q: q_sfx, k_sfx, v_sfx = "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"
-    elif "query"   in sample_q: q_sfx, k_sfx, v_sfx = "attention.query.weight",  "attention.key.weight",     "attention.value.weight"
-    elif "wq"      in sample_q: q_sfx, k_sfx, v_sfx = "attention.wq.weight",     "attention.wk.weight",      "attention.wv.weight"
-    else:
-        q_sfx = sample_q.split("layers.0.")[-1]
-        k_sfx = q_sfx.replace("q.", "k.")
-        v_sfx = q_sfx.replace("q.", "v.")
+    log_lines.append(f"🔑 总 key 数：{total_keys}\n")
+    log_lines.append(f"📐 发现层组：\n")
+    for (modality, prefix), layers in sorted(groups.items()):
+        log_lines.append(
+            f"   [{modality:6s}] prefix='{prefix}' "
+            f"层数={len(layers)} 范围={min(layers)}~{max(layers)}\n"
+        )
+    log_lines.append(f"{'─'*80}\n")
 
-    log_lines.append(f"🔑 Q suffix：{q_sfx}\n")
-    log_lines.append(f"🔑 K suffix：{k_sfx}\n")
-    log_lines.append(f"🔑 V suffix：{v_sfx}\n")    # [改动3]
+    # ★ 只分析 text 模态（视觉层暂不分析）
+    text_layers = sorted([
+        (uid, info) for uid, info in layer_map.items()
+        if uid[0] == "text"
+    ], key=lambda x: x[0][2])  # 按 layer_idx 排序
+
+    if not text_layers:
+        return (
+            "".join(log_lines) +
+            "❌ 未发现任何文本层\n", None
+        )
+
+    log_lines.append(f"🔵 将分析 {len(text_layers)} 个文本层（前 {max_layers} 层）\n")
     log_lines.append(f"{'═'*80}\n")
 
-    # ── 辅助：查找 key 所在 shard ─────────────────
-    def get_shard_for_key(key: str) -> str | None:
-        if index_data:
-            return index_data["weight_map"].get(key)
-        for sf in sf_files:
-            if sf not in shard_headers:
-                h, hs = read_safetensors_header(get_file_url(model_id, sf), token)
-                shard_headers[sf] = (h, hs)
-            if key in shard_headers[sf][0]:
-                return sf
-        return None
-
     # ── 逐层分析 ─────────────────────────────────
-    gqa_logged = False
+    gqa_logged   = False
+    layers_done  = 0
+    max_layers_i = int(max_layers)
 
-    for layer_idx in range(int(max_layers)):
+    for (modality, prefix, layer_idx), qkv in text_layers:
+        if layers_done >= max_layers_i:
+            break
+
         progress(
-            0.10 + 0.85 * layer_idx / int(max_layers),
+            0.15 + 0.80 * layers_done / max(max_layers_i, 1),
             desc=f"第 {layer_idx} 层..."
         )
 
-        q_key = f"model.layers.{layer_idx}.{q_sfx}"
-        k_key = f"model.layers.{layer_idx}.{k_sfx}"
-        v_key = f"model.layers.{layer_idx}.{v_sfx}"    # [改动3]
-
-        q_shard = get_shard_for_key(q_key)
-        k_shard = get_shard_for_key(k_key)
-        v_shard = get_shard_for_key(v_key)              # [改动3]
-
-        if q_shard is None or k_shard is None:
+        if qkv["q"] is None or qkv["k"] is None or qkv["v"] is None:
             log_lines.append(
-                f"\nLayer {layer_idx}: Q/K 未找到，分析结束（共 {layer_idx} 层）\n"
-            )
-            break
-
-        # [改动3] V 找不到时降级处理（不阻断整体分析）
-        if v_shard is None:
-            log_lines.append(
-                f"Layer {layer_idx}: ⚠️ V 未找到，跳过该层\n"
+                f"Layer {layer_idx} [{modality}]: ⚠️ Q/K/V 不完整，跳过\n"
             )
             continue
 
-        for shard in {q_shard, k_shard, v_shard}:
-            if shard not in shard_headers:
-                h, hs = read_safetensors_header(get_file_url(model_id, shard), token)
-                shard_headers[shard] = (h, hs)
+        q_shard, q_key = qkv["q"]
+        k_shard, k_key = qkv["k"]
+        v_shard, v_key = qkv["v"]
 
         try:
             W_q = load_tensor_remote(
                 get_file_url(model_id, q_shard), q_key,
-                *shard_headers[q_shard], token
+                *all_shard_headers[q_shard], token
             )
             W_k = load_tensor_remote(
                 get_file_url(model_id, k_shard), k_key,
-                *shard_headers[k_shard], token
+                *all_shard_headers[k_shard], token
             )
-            W_v = load_tensor_remote(                   # [改动3]
+            W_v = load_tensor_remote(
                 get_file_url(model_id, v_shard), v_key,
-                *shard_headers[v_shard], token
+                *all_shard_headers[v_shard], token
             )
         except ValueError as e:
             log_lines.append(f"Layer {layer_idx}: ⚠️ 跳过（{e}）\n")
+            layers_done += 1
+            continue
+        except Exception as e:
+            log_lines.append(f"Layer {layer_idx}: ❌ 加载失败（{e}）\n")
+            layers_done += 1
             continue
 
         if W_q is None or W_k is None or W_v is None:
             log_lines.append(f"Layer {layer_idx}: ⚠️ tensor 为 None，跳过\n")
+            layers_done += 1
             continue
 
-        # [改动1] 判断该层是文本层还是视觉层
-        modality = "vision" if is_vision_key(q_key) else "text"
-        if modality == "vision":
-            log_lines.append(f"Layer {layer_idx}: 🖼️ 视觉层，跳过\n")
+        # ★ 一致性校验
+        if W_q.shape[1] != W_k.shape[1] or W_k.shape[1] != W_v.shape[1]:
+            log_lines.append(
+                f"Layer {layer_idx}: ⚠️ Q/K/V 输入维度不一致 "
+                f"Wq={list(W_q.shape)} Wk={list(W_k.shape)} "
+                f"Wv={list(W_v.shape)}，跳过\n"
+            )
             del W_q, W_k, W_v
+            layers_done += 1
             continue
 
-        # GQA 推断
         try:
-            n_q_heads, n_kv_heads, d_head = infer_gqa_params(W_q, W_k, config)
+            n_q_heads, n_kv_heads, d_head = infer_gqa_params(
+                W_q, W_k, config_params, modality=modality
+            )
         except ValueError as e:
             log_lines.append(f"Layer {layer_idx}: ❌ GQA 推断失败：{e}\n")
             del W_q, W_k, W_v
+            layers_done += 1
             continue
 
         if not gqa_logged:
@@ -663,29 +735,31 @@ def analyze_model(
                 f"🧠 GQA 结构：n_q={n_q_heads} n_kv={n_kv_heads} "
                 f"group={n_q_heads//n_kv_heads} d_head={d_head}\n"
                 f"   W_q={list(W_q.shape)} W_k={list(W_k.shape)} "
-                f"W_v={list(W_v.shape)}\n"   # [改动3]
+                f"W_v={list(W_v.shape)}\n"
                 f"{'═'*80}\n"
             )
             gqa_logged = True
 
-        # 逐头全指标计算
         records, layer_log = analyze_layer_heads(
-            W_q, W_k, W_v,              # [改动3]
+            W_q, W_k, W_v,
             layer_idx,
             n_q_heads, n_kv_heads, d_head,
-            modality=modality            # [改动4]
+            modality=modality
         )
         all_records.extend(records)
         log_lines.append(layer_log)
 
         del W_q, W_k, W_v
+        layers_done += 1
 
-    # ── 全局汇总 ──────────────────────────────────
+    # ── 汇总 ─────────────────────────────────────
     if all_records:
         df = pd.DataFrame(all_records)
 
-        # [改动5] 分模态统计
         def stat_block(arr: np.ndarray, name: str) -> str:
+            arr = arr[~np.isnan(arr)]
+            if len(arr) == 0:
+                return f"  {name:<14} (无数据)\n"
             return (
                 f"  {name:<14}"
                 f" Median={np.median(arr):.6f}"
@@ -706,25 +780,25 @@ def analyze_model(
 
             f"【第一定律 — Pearson r（→ 1）】\n",
             stat_block(text_df["pearson_QK"].values, "Q-K:"),
-            stat_block(text_df["pearson_QV"].values, "Q-V:"),   # [改动3]
-            stat_block(text_df["pearson_KV"].values, "K-V:"),   # [改动3]
+            stat_block(text_df["pearson_QV"].values, "Q-V:"),
+            stat_block(text_df["pearson_KV"].values, "K-V:"),
 
             f"\n【第二定律 — SSR（→ 0）】\n",
             stat_block(text_df["ssr_QK"].values, "Q-K:"),
-            stat_block(text_df["ssr_QV"].values, "Q-V:"),       # [改动3]
-            stat_block(text_df["ssr_KV"].values, "K-V:"),       # [改动3]
+            stat_block(text_df["ssr_QV"].values, "Q-V:"),
+            stat_block(text_df["ssr_KV"].values, "K-V:"),
 
-            f"\n【第四定律 — cosU 输出子空间（Q-K≈1/√d，Q-V<1/√d 超正交）】\n",
+            f"\n【第四定律 — cosU 输出子空间】\n",
             stat_block(text_df["cosU_QK"].values, "cosU Q-K:"),
-            stat_block(text_df["cosU_QV"].values, "cosU Q-V:"), # [改动3]
-            stat_block(text_df["cosU_KV"].values, "cosU K-V:"), # [改动3]
+            stat_block(text_df["cosU_QV"].values, "cosU Q-V:"),
+            stat_block(text_df["cosU_KV"].values, "cosU K-V:"),
 
-            f"\n【第五定律 — cosV 输入子空间（≈1/√d_model 全局随机正交）】\n",  # [改动2]
+            f"\n【第五定律 — cosV 输入子空间】\n",
             stat_block(text_df["cosV_QK"].values, "cosV Q-K:"),
             stat_block(text_df["cosV_QV"].values, "cosV Q-V:"),
             stat_block(text_df["cosV_KV"].values, "cosV K-V:"),
 
-            f"\n【第三定律 — 条件数（越小越稳定）】\n",              # [改动3]
+            f"\n【第三定律 — 条件数】\n",
             stat_block(text_df["cond_Q"].values,  "cond Q:"),
             stat_block(text_df["cond_K"].values,  "cond K:"),
             stat_block(text_df["cond_V"].values,  "cond V:"),
@@ -740,7 +814,7 @@ def analyze_model(
 
 
 # ─────────────────────────────────────────────
-# Gradio UI
+# Gradio UI（不变）
 # ─────────────────────────────────────────────
 
 with gr.Blocks(title="Wang's Five Laws — LLM Spectral Analyzer") as demo:
@@ -750,18 +824,6 @@ with gr.Blocks(title="Wang's Five Laws — LLM Spectral Analyzer") as demo:
     **Mathematical Foundations of Large Language Models (MF-LLM)**
 
     通过 **HTTP Range Request** 直接读取 HF 权重，**无需下载整个模型**。
-    支持 GQA + 多模态（自动跳过视觉层）。逐头计算全部五定律指标：
-
-    | 定律 | 指标 | 理论极值 | 对象 |
-    |------|------|---------|------|
-    | 第一定律 | Pearson r / Spearman r | → 1 | Q-K |
-    | 第二定律 | SSR | → 0 | Q-K, Q-V, K-V |
-    | 第三定律 | 条件数 κ | 越小越好 | Q, K, V |
-    | 第四定律 | cosU(Uq,Uk) | ≈1/√d_head；cosU(Uq,Uv)<1/√d_head | Q-K, Q-V, K-V |
-    | 第五定律 | cosV(Vq,Vk) | ≈1/√d_model（随机正交） | Q-K, Q-V, K-V |
-
-    [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19707844-blue)](https://doi.org/10.5281/zenodo.19707844)
-    [![HAL](https://img.shields.io/badge/HAL-hal--05609398-red)](https://hal.science/hal-05609398)
     """)
 
     with gr.Row():
@@ -782,33 +844,25 @@ with gr.Blocks(title="Wang's Five Laws — LLM Spectral Analyzer") as demo:
             )
             analyze_btn = gr.Button("🚀 开始分析", variant="primary")
 
-        # [改动6] 更新推荐模型列表
         with gr.Column(scale=1):
             gr.Markdown("""
             ### ✅ 推荐模型
             ```
-            Qwen/Qwen2.5-14B-Instruct        (GQA 8Q/2K)
-            meta-llama/Llama-3-8B            (GQA)
-            google/gemma-4-e2b               (MHA 多模态)
-            google/gemma-4-e4b-it            (MHA 多模态)
+            Qwen/Qwen2.5-14B-Instruct
+            meta-llama/Llama-3-8B
+            google/gemma-4-e2b
+            google/gemma-4-31b-it
             deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
             ```
-            ### GQA 典型结构
-            | 模型 | Q头 | KV头 | 每组 |
-            |------|-----|------|------|
-            | Qwen2.5-7B | 28 | 4 | 7 |
-            | LLaMA-3-8B | 32 | 8 | 4 |
-            | Qwen2.5-14B | 40 | 8 | 5 |
-            | Gemma-4-E2B | 8 | 4 | 2 |
-
-            ### 🖼️ 多模态说明
-            - 视觉层自动跳过
-            - 仅分析文本 Transformer 层
-            - 跳过关键词：`vision / visual / vit / patch_embed`
+            ### 🔑 关键修复
+            - ✅ 模态判断基于 prefix 路径
+            - ✅ 视觉/文本层分组独立编号
+            - ✅ Q/K/V 输入维度一致性校验
+            - ✅ 视觉层不复用文本 head_dim
             """)
 
     log_output = gr.Textbox(
-        label="分析日志（逐头详情）",
+        label="分析日志",
         lines=35, max_lines=100
     )
 
