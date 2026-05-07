@@ -679,9 +679,10 @@ with gr.Blocks(title="Wang's Five Laws — LLM Spectral Analyzer") as demo:
             gr.Markdown("""
             ### ✅ 推荐模型
             ```
-            Qwen/Qwen2.5-7B-Instruct        (GQA 8Q/2K)
-            meta-llama/Llama-3.2-1B         (GQA)
-            google/gemma-2-2b               (MHA)
+            Qwen/Qwen2.5-14B-Instruct        (GQA 8Q/2K)
+            meta-llama/Llama-3-8B            (GQA)
+            google/gemma-4-e2b               (MHA)
+            google/gemma-4-e4b-it            (MHA)
             deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
             ```
             ### GQA 典型结构
