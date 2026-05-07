@@ -662,11 +662,180 @@ def analyze_model(
     return "".join(log), df
 
 
+def inspect_model_structure(
+    model_id: str,
+    hf_token: str,
+    progress=gr.Progress()
+) -> str:
+    """
+    不做任何分析，只打印模型的原始 key 结构。
+    让用户自己看清楚每一层到底有什么。
+    """
+    token = hf_token.strip() or None
+    log   = [f"🔬 结构探测：{model_id}\n{'═'*80}\n"]
+
+    # 获取 shard 列表
+    try:
+        index_data  = find_index_file(model_id, token)
+        shard_files = (
+            sorted(set(index_data["weight_map"].values()))
+            if index_data else get_safetensor_files(model_id, token)
+        )
+    except Exception as e:
+        return f"❌ 获取文件列表失败：{e}"
+
+    # 读取所有 header
+    all_shard_headers = {}
+    for sf in shard_files:
+        try:
+            h, hs = read_safetensors_header(get_file_url(model_id, sf), token)
+            all_shard_headers[sf] = (h, hs)
+        except Exception as e:
+            log.append(f"⚠️  {sf}：{e}\n")
+
+    # ── 收集所有含 layers.{N}. 的 key ────────────
+    # 结构：{ layer_idx: [ (prefix, suffix, shape, dtype) ] }
+    layer_entries: dict[int, list] = {}
+
+    for shard_name, (header, _) in all_shard_headers.items():
+        for key, info in header.items():
+            m = re.search(r'layers\.(\d+)\.', key)
+            if not m:
+                continue
+            layer_idx = int(m.group(1))
+            prefix    = key[:m.start()]
+            suffix    = key[m.end():]
+            shape     = info.get("shape", [])
+            dtype     = info.get("dtype", "?")
+
+            if layer_idx not in layer_entries:
+                layer_entries[layer_idx] = []
+            layer_entries[layer_idx].append((prefix, suffix, shape, dtype))
+
+    if not layer_entries:
+        return "".join(log) + "⚠️ 未找到任何含 layers.{N}. 的 key\n"
+
+    # ── 打印结构 ──────────────────────────────────
+    log.append(f"📊 共发现层号：{sorted(layer_entries.keys())}\n")
+    log.append(f"{'─'*80}\n")
+
+    for layer_idx in sorted(layer_entries.keys()):
+        entries = layer_entries[layer_idx]
+
+        # 按 prefix 分组
+        by_prefix: dict[str, list] = {}
+        for prefix, suffix, shape, dtype in entries:
+            by_prefix.setdefault(prefix, []).append((suffix, shape, dtype))
+
+        log.append(f"\n【Layer {layer_idx}】— 共 {len(entries)} 个 key，"
+                   f"涉及 {len(by_prefix)} 个组件前缀\n")
+
+        for prefix, items in sorted(by_prefix.items()):
+            log.append(f"  前缀: '{prefix}'\n")
+            for suffix, shape, dtype in sorted(items):
+                log.append(f"    {suffix:<50} {str(shape):<20} {dtype}\n")
+
+    log.append(f"\n{'═'*80}\n")
+    log.append("📌 说明：\n")
+    log.append("  - 如果每层只有一个前缀 → 该层属于单一组件\n")
+    log.append("  - 如果每层有多个前缀 → 不同组件恰好共用同一层号（独立权重，不混合）\n")
+    log.append("  - 层号只是 key 名里的数字，不代表物理上是同一层\n")
+
+    return "".join(log)
+
 # ─────────────────────────────────────────────
 # Gradio UI
 # ─────────────────────────────────────────────
 
 with gr.Blocks(title="Wang's Five Laws — LLM Spectral Analyzer") as demo:
+
+    with gr.Tabs():
+
+        # ── Tab 1：结构探测 ────────────────────────
+        with gr.Tab("🔬 结构探测"):
+            gr.Markdown("""
+            **先运行这个**，看清模型的原始 key 结构，
+            再决定分析哪些层号。
+            """)
+            with gr.Row():
+                inspect_model_input = gr.Textbox(
+                    label="模型 ID",
+                    value="google/gemma-4-e2b"
+                )
+                inspect_token_input = gr.Textbox(
+                    label="HF Token",
+                    type="password"
+                )
+            inspect_btn = gr.Button("🔍 探测结构", variant="secondary")
+            inspect_output = gr.Textbox(
+                label="原始结构",
+                lines=50, max_lines=200
+            )
+            inspect_btn.click(
+                fn=inspect_model_structure,
+                inputs=[inspect_model_input, inspect_token_input],
+                outputs=[inspect_output]
+            )
+
+        # ── Tab 2：分析 ───────────────────────────
+        with gr.Tab("📊 分析"):
+            with gr.Row():
+                with gr.Column(scale=2):
+                    model_input = gr.Textbox(
+                        label="HuggingFace 模型 ID",
+                        value="google/gemma-4-e2b"
+                    )
+                    token_input = gr.Textbox(
+                        label="HF Access Token",
+                        type="password"
+                    )
+                    with gr.Row():
+                        start_layer_input = gr.Number(
+                            label="起始层号（含）",
+                            value=0, minimum=0, maximum=999, precision=0
+                        )
+                        end_layer_input = gr.Number(
+                            label="结束层号（含）",
+                            value=5, minimum=0, maximum=999, precision=0
+                        )
+                    analyze_btn = gr.Button("🚀 开始分析", variant="primary")
+
+                with gr.Column(scale=1):
+                    gr.Markdown("""
+                    ### 层号说明
+                    层号 = safetensors key 中 `layers.{N}` 的 **N**
+
+                    **先用「结构探测」Tab 确认实际层号分布**
+
+                    ### Gemma-4-E2B 待确认：
+                    - audio/vision/language 是否共用层号？
+                    - 还是各自独立编号？
+                    """)
+
+            log_output = gr.Textbox(label="分析日志", lines=40, max_lines=300)
+            table_output = gr.Dataframe(
+                label="逐头全指标结果表",
+                headers=[
+                    "prefix","layer","kv_head","q_head",
+                    "pearson_QK","spearman_QK","pearson_QV","pearson_KV",
+                    "ssr_QK","ssr_QV","ssr_KV",
+                    "cosU_QK","cosU_QV","cosU_KV",
+                    "cosV_QK","cosV_QV","cosV_KV",
+                    "alpha_QK","alpha_QV","alpha_KV",
+                    "alpha_res_QK","alpha_res_QV","alpha_res_KV",
+                    "sigma_max_Q","sigma_min_Q",
+                    "sigma_max_K","sigma_min_K",
+                    "sigma_max_V","sigma_min_V",
+                    "cond_Q","cond_K","cond_V",
+                ]
+            )
+
+            analyze_btn.click(
+                fn=analyze_model,
+                inputs=[model_input, token_input,
+                        start_layer_input, end_layer_input],
+                outputs=[log_output, table_output]
+            )
 
     gr.Markdown("""
     # 🔬 Wang's Five Laws — LLM Spectral Analyzer
