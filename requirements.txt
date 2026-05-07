@@ -1,0 +1,6 @@
+gradio>=4.0.0
+requests
+numpy
+scipy
+torch
+huggingface_hub
