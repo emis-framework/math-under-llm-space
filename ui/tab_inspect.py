@@ -22,6 +22,38 @@ from core.layer_profile import (
     extract_config_params,
 )
 
+SIDEBAR_MD = """
+### ✅ 推荐模型
+google/gemma-4-e2b
+google/gemma-4-e4b-it
+google/gemma-4-31b-it
+Qwen/Qwen2.5-14B-Instruct
+deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
+meta-llama/Meta-Llama-3-8B
+
+
+### 层号说明
+- 层号 = safetensors key 中 `layers.{N}` 的 **N**
+- **不按组件重排**，原始值直接输出
+- 混合模态模型（如 Gemma-4）：
+  - `layers.0~11` 同时含 audio/vision/text 层
+  - 全部输出，按前缀区分组件
+
+### 示例：Gemma-4-E2B
+| 组件 | 层范围 |
+|------|--------|
+| audio_tower | 0~11 |
+| language_model | 0~34 |
+| vision_tower | 0~15 |
+
+### 示例：Gemma-4-31B
+| 组件 | 层范围 |
+|------|--------|
+| language(局部层) | 0~59 |
+| language(全局层) | 5,11,17...59 |
+| vision_tower | 0~26 |
+"""
+
 
 def inspect_model(
     model_id: str,
@@ -134,11 +166,8 @@ def inspect_model(
 def build_tab_inspect():
     with gr.Tab("🔬 结构探测"):
         gr.Markdown("""
-        **第一步：先探测模型结构**
-        - 自动识别所有组件（language/vision/audio）
-        - 自动推断 head_dim（支持异构层，如 Gemma-4-31B 局部/全局层）
-        - 自动检测 K=V 共享层
-        - 结果供「分析」Tab 使用
+        **第一步：先探测模型结构**，自动识别组件、head_dim、K=V共享层。
+        结果供「分析」Tab 使用。
         """)
 
         with gr.Row():
@@ -148,15 +177,14 @@ def build_tab_inspect():
                     placeholder="google/gemma-4-e2b",
                     value="google/gemma-4-e2b"
                 )
-            with gr.Column(scale=2):
                 inspect_token = gr.Textbox(
                     label="HF Access Token（公开模型可留空）",
                     type="password"
                 )
+                inspect_btn = gr.Button("🔍 探测结构", variant="secondary")
+
             with gr.Column(scale=1):
-                inspect_btn = gr.Button(
-                    "🔍 探测结构", variant="secondary", size="lg"
-                )
+                gr.Markdown(SIDEBAR_MD)
 
         inspect_log = gr.Textbox(
             label="结构探测日志",

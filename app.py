@@ -11,7 +11,7 @@ from ui.tab_analyze import build_tab_analyze
 
 with gr.Blocks(
     title="Wang's Five Laws — LLM Spectral Analyzer",
-    theme=gr.themes.Soft()
+    # theme=gr.themes.Soft()
 ) as demo:
 
     gr.Markdown("""

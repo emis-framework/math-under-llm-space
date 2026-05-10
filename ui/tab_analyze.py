@@ -26,6 +26,39 @@ from core.layer_profile import (
 from core.metrics import analyze_layer, summarize_records
 
 
+SIDEBAR_MD = """
+### ✅ 推荐模型
+google/gemma-4-e2b
+google/gemma-4-e4b-it
+google/gemma-4-31b-it
+Qwen/Qwen2.5-14B-Instruct
+deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
+meta-llama/Meta-Llama-3-8B
+
+
+### 层号说明
+- 层号 = safetensors key 中 `layers.{N}` 的 **N**
+- **不按组件重排**，原始值直接输出
+- 混合模态模型（如 Gemma-4）：
+  - `layers.0~11` 同时含 audio/vision/text 层
+  - 全部输出，按前缀区分组件
+
+### 示例：Gemma-4-E2B
+| 组件 | 层范围 |
+|------|--------|
+| audio_tower | 0~11 |
+| language_model | 0~34 |
+| vision_tower | 0~15 |
+
+### 示例：Gemma-4-31B
+| 组件 | 层范围 |
+|------|--------|
+| language(局部层) | 0~59 |
+| language(全局层) | 5,11,17...59 |
+| vision_tower | 0~26 |
+"""
+
+
 def run_analysis(
     model_id:    str,
     hf_token:    str,
@@ -186,16 +219,11 @@ def run_analysis(
 # Tab2 UI 组件
 # ─────────────────────────────────────────────
 
-def build_tab_analyze(
-    shared_model_id: gr.Textbox = None,
-    shared_token:    gr.Textbox = None,
-):
+def build_tab_analyze():
     with gr.Tab("📊 分析"):
         gr.Markdown("""
         **第二步：选择层范围，计算王氏五定律全指标**
-        - 层号 = safetensors key 中 `layers.{N}` 的原始 N
-        - 所有组件（language/vision/audio）同时分析
-        - K=V 共享层自动标注，KV 指标填理论值
+        层号 = safetensors key 中 `layers.{N}` 的原始 N，K=V 共享层自动处理。
         """)
 
         with gr.Row():
@@ -205,37 +233,23 @@ def build_tab_analyze(
                     placeholder="google/gemma-4-e2b",
                     value="google/gemma-4-e2b"
                 )
-            with gr.Column(scale=2):
                 token_input = gr.Textbox(
-                    label="HF Access Token",
+                    label="HF Access Token（公开模型可留空）",
                     type="password"
                 )
+                with gr.Row():
+                    start_input = gr.Number(
+                        label="起始层号（含）",
+                        value=0, minimum=0, maximum=9999, precision=0
+                    )
+                    end_input = gr.Number(
+                        label="结束层号（含）",
+                        value=5, minimum=0, maximum=9999, precision=0
+                    )
+                analyze_btn = gr.Button("🚀 开始分析", variant="primary")
 
-        with gr.Row():
-            start_input = gr.Number(
-                label="起始层号（含）",
-                value=0, minimum=0, maximum=9999, precision=0
-            )
-            end_input = gr.Number(
-                label="结束层号（含）",
-                value=5, minimum=0, maximum=9999, precision=0
-            )
-            analyze_btn = gr.Button(
-                "🚀 开始分析", variant="primary", size="lg"
-            )
-
-        with gr.Row():
-            gr.Markdown("""
-            ### 层号参考
-            | 模型 | 组件 | 层范围 |
-            |------|------|--------|
-            | Gemma-4-E2B | language | 0~34 |
-            | Gemma-4-E2B | vision | 0~15 |
-            | Gemma-4-31B | language(local) | 0~59（非5的倍数+5） |
-            | Gemma-4-31B | language(global) | 5,11,17...59 |
-            | Qwen2.5-14B | language | 0~47 |
-            | LLaMA-3-8B | language | 0~31 |
-            """)
+            with gr.Column(scale=1):
+                gr.Markdown(SIDEBAR_MD)
 
         analyze_log = gr.Textbox(
             label="分析日志（逐头详情）",
