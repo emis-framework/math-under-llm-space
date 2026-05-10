@@ -143,17 +143,53 @@ def extract_config_params(config: dict) -> dict:
 # ─────────────────────────────────────────────
 
 def _classify_qkv_suffix(suffix: str) -> str | None:
+    """
+    layers.{N}. 之后的后缀 → 'q'/'k'/'v'/None
+    
+    支持格式：
+      标准:   self_attn.q_proj.weight
+      嵌套:   self_attn.q_proj.linear.weight  (audio/vision tower)
+    
+    Gemma-4 实测后缀：
+      audio:   self_attn.q_proj.linear.weight   [1024, 1024]
+      audio:   self_attn.k_proj.linear.weight   [1024, 1024]
+      audio:   self_attn.v_proj.linear.weight   [1024, 1024]
+      vision:  self_attn.q_proj.linear.weight   [768, 768]
+      vision:  self_attn.k_proj.linear.weight   [768, 768]
+      vision:  self_attn.v_proj.linear.weight   [768, 768]
+      text:    self_attn.q_proj.weight           [2048, 1536]
+      text:    self_attn.k_proj.weight           [256, 1536]
+      text:    self_attn.v_proj.weight           [256, 1536]
+    """
     if not suffix.endswith(".weight"):
         return None
-    excludes = ["norm", "rope", "embed", "lm_head", "layernorm", "ln_"]
+
     s = suffix.lower()
+
+    # 精确排除非QKV权重
+    excludes = [
+        "norm", "rope", "embed", "lm_head", "layernorm", "ln_",
+        "o_proj", "out_proj",           # 输出投影
+        "post", "relative",             # audio tower 特有
+        "per_dim", "scalar",            # audio tower 特有
+        "gate_proj", "up_proj", "down_proj",  # FFN
+        "ffw_layer",                    # audio FFN
+        "depthwise", "conv",            # audio conv
+        "linear_start", "linear_end",   # audio conv
+        "per_layer",                    # language model 特有
+    ]
     if any(e in s for e in excludes):
         return None
+
+    # Q/K/V 匹配
     if any(p in s for p in ["q_proj", "wq", "query", "q_a", "q_b"]):
         return "q"
-    if any(p in s for p in ["k_proj", "wk", "key",   "k_a", "k_b"]):
+    if any(p in s for p in ["k_proj", "wk",           "k_a", "k_b"]):
+        # 排除 k_norm（已在上面 norm 过滤，但双重保险）
+        if "k_norm" in s:
+            return None
         return "k"
-    if any(p in s for p in ["v_proj", "wv", "value", "v_a", "v_b"]):
+    if any(p in s for p in ["v_proj", "wv", "value",  "v_a", "v_b"]):
         return "v"
     return None
 
@@ -779,6 +815,24 @@ with gr.Blocks(title="Wang's Five Laws — LLM Spectral Analyzer") as demo:
 
         # ── Tab 2：分析 ───────────────────────────
         with gr.Tab("📊 分析"):
+            gr.Markdown("""
+            # 🔬 Wang's Five Laws — LLM Spectral Analyzer
+            **Mathematical Foundations of Large Language Models (MF-LLM)**
+
+            通过 **HTTP Range Request** 直接读取 HF 权重，**无需下载整个模型**。  
+            按 safetensors 原始层号分析，支持混合模态模型（视觉/音频/语言同时输出）。
+
+            | 定律 | 指标 | 理论极值 |
+            |------|------|---------|
+            | 第一定律 | Pearson r | → 1 |
+            | 第二定律 | SSR | → 0 |
+            | 第三定律 | 条件数 κ | 越小越好 |
+            | 第四定律 | cosU(Uq,Uv) | < 1/√d_head（超正交） |
+            | 第五定律 | cosV | ≈ 1/√d_model（随机正交） |
+
+            [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19707844-blue)](https://doi.org/10.5281/zenodo.19707844)
+            [![HAL](https://img.shields.io/badge/HAL-hal--05609398-red)](https://hal.science/hal-05609398)
+            """)
             with gr.Row():
                 with gr.Column(scale=2):
                     model_input = gr.Textbox(
@@ -802,14 +856,27 @@ with gr.Blocks(title="Wang's Five Laws — LLM Spectral Analyzer") as demo:
 
                 with gr.Column(scale=1):
                     gr.Markdown("""
+                    ### ✅ 推荐模型
+                    ```
+                    google/gemma-4-e2b
+                    google/gemma-4-31b-it
+                    Qwen/Qwen2.5-14B-Instruct
+                    meta-llama/Llama-3-8B
+                    deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
+                    ```
                     ### 层号说明
-                    层号 = safetensors key 中 `layers.{N}` 的 **N**
+                    - 层号 = safetensors key 中 `layers.{N}` 的 **N**
+                    - **不按组件重排**，原始值直接输出
+                    - 混合模态模型（如 Gemma-4）：
+                    - `layers.0~11` 同时含 audio/vision/text 层
+                    - 全部输出，按前缀区分组件
 
-                    **先用「结构探测」Tab 确认实际层号分布**
-
-                    ### Gemma-4-E2B 待确认：
-                    - audio/vision/language 是否共用层号？
-                    - 还是各自独立编号？
+                    ### 示例：Gemma-4-E2B
+                    | 组件 | 层范围 |
+                    |------|--------|
+                    | audio_tower | 0~11 |
+                    | language_model | 0~34 |
+                    | vision_tower | 0~15 |
                     """)
 
             log_output = gr.Textbox(label="分析日志", lines=40, max_lines=300)
@@ -837,99 +904,7 @@ with gr.Blocks(title="Wang's Five Laws — LLM Spectral Analyzer") as demo:
                 outputs=[log_output, table_output]
             )
 
-    gr.Markdown("""
-    # 🔬 Wang's Five Laws — LLM Spectral Analyzer
-    **Mathematical Foundations of Large Language Models (MF-LLM)**
-
-    通过 **HTTP Range Request** 直接读取 HF 权重，**无需下载整个模型**。  
-    按 safetensors 原始层号分析，支持混合模态模型（视觉/音频/语言同时输出）。
-
-    | 定律 | 指标 | 理论极值 |
-    |------|------|---------|
-    | 第一定律 | Pearson r | → 1 |
-    | 第二定律 | SSR | → 0 |
-    | 第三定律 | 条件数 κ | 越小越好 |
-    | 第四定律 | cosU(Uq,Uv) | < 1/√d_head（超正交） |
-    | 第五定律 | cosV | ≈ 1/√d_model（随机正交） |
-
-    [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19707844-blue)](https://doi.org/10.5281/zenodo.19707844)
-    [![HAL](https://img.shields.io/badge/HAL-hal--05609398-red)](https://hal.science/hal-05609398)
-    """)
-
-    with gr.Row():
-        with gr.Column(scale=2):
-            model_input = gr.Textbox(
-                label="HuggingFace 模型 ID",
-                placeholder="google/gemma-4-e2b",
-                value="google/gemma-4-e2b"
-            )
-            token_input = gr.Textbox(
-                label="HF Access Token（公开模型可留空）",
-                placeholder="hf_xxxxxxxxxxxxxxxx",
-                type="password"
-            )
-            with gr.Row():
-                start_layer_input = gr.Number(
-                    label="起始层号（原始层号，含）",
-                    value=0, minimum=0, maximum=999, precision=0
-                )
-                end_layer_input = gr.Number(
-                    label="结束层号（原始层号，含）",
-                    value=5, minimum=0, maximum=999, precision=0
-                )
-            analyze_btn = gr.Button("🚀 开始分析", variant="primary")
-
-        with gr.Column(scale=1):
-            gr.Markdown("""
-            ### ✅ 推荐模型
-            ```
-            google/gemma-4-e2b
-            google/gemma-4-31b-it
-            Qwen/Qwen2.5-14B-Instruct
-            meta-llama/Llama-3-8B
-            deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
-            ```
-            ### 层号说明
-            - 层号 = safetensors key 中 `layers.{N}` 的 **N**
-            - **不按组件重排**，原始值直接输出
-            - 混合模态模型（如 Gemma-4）：
-              - `layers.0~11` 同时含 audio/vision/text 层
-              - 全部输出，按前缀区分组件
-
-            ### 示例：Gemma-4-E2B
-            | 组件 | 层范围 |
-            |------|--------|
-            | audio_tower | 0~11 |
-            | language_model | 0~34 |
-            | vision_tower | 0~15 |
-            """)
-
-    log_output = gr.Textbox(
-        label="分析日志",
-        lines=40, max_lines=300
-    )
-    table_output = gr.Dataframe(
-        label="逐头全指标结果表",
-        headers=[
-            "prefix","layer","kv_head","q_head",
-            "pearson_QK","spearman_QK","pearson_QV","pearson_KV",
-            "ssr_QK","ssr_QV","ssr_KV",
-            "cosU_QK","cosU_QV","cosU_KV",
-            "cosV_QK","cosV_QV","cosV_KV",
-            "alpha_QK","alpha_QV","alpha_KV",
-            "alpha_res_QK","alpha_res_QV","alpha_res_KV",
-            "sigma_max_Q","sigma_min_Q",
-            "sigma_max_K","sigma_min_K",
-            "sigma_max_V","sigma_min_V",
-            "cond_Q","cond_K","cond_V",
-        ]
-    )
-
-    analyze_btn.click(
-        fn=analyze_model,
-        inputs=[model_input, token_input, start_layer_input, end_layer_input],
-        outputs=[log_output, table_output]
-    )
+    
 
 if __name__ == "__main__":
     demo.launch()
