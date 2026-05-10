@@ -80,7 +80,6 @@ def load_tensor_remote(
     header_size: int,
     token: str = None
 ) -> torch.Tensor | None:
-    """远程加载单个 tensor，返回 float32"""
     if tensor_name not in header:
         return None
 
@@ -94,9 +93,26 @@ def load_tensor_remote(
     if dtype_str in UNSUPPORTED_SVD_DTYPES:
         raise ValueError(f"dtype={dtype_str} 为量化格式，无法 SVD")
 
-    torch_dtype, _ = DTYPE_MAP[dtype_str]
+    torch_dtype, bytes_per_elem = DTYPE_MAP[dtype_str]
     abs_start = 8 + header_size + offsets[0]
     abs_end   = 8 + header_size + offsets[1] - 1
+
+    # ── 调试：打印偏移信息 ────────────────────────
+    expected_bytes = offsets[1] - offsets[0]
+    expected_elems = 1
+    for d in shape:
+        expected_elems *= d
+    print(
+        f"[FETCH] {tensor_name}\n"
+        f"  shape={shape} dtype={dtype_str}\n"
+        f"  data_offsets={offsets}\n"
+        f"  abs_start={abs_start} abs_end={abs_end}\n"
+        f"  expected_bytes={expected_bytes} "
+        f"expected_elems={expected_elems} "
+        f"bytes_per_elem={bytes_per_elem}\n"
+        f"  check: {expected_elems * bytes_per_elem} == {expected_bytes} "
+        f"{'✅' if expected_elems * bytes_per_elem == expected_bytes else '❌ 不匹配!'}\n"
+    )
 
     req_headers = {"Range": f"bytes={abs_start}-{abs_end}"}
     if token:
@@ -105,6 +121,14 @@ def load_tensor_remote(
     r = requests.get(url, headers=req_headers, timeout=120)
     r.raise_for_status()
 
+    # ── 调试：打印实际收到的字节数 ────────────────
+    actual_bytes = len(r.content)
+    print(
+        f"  actual_bytes={actual_bytes} "
+        f"{'✅' if actual_bytes == expected_bytes else '❌ 字节数不匹配!'}\n"
+        f"  前8字节(hex)={r.content[:8].hex()}\n"
+    )
+
     if torch_dtype == torch.bfloat16:
         tensor = torch.frombuffer(
             bytearray(r.content), dtype=torch.int16
@@ -112,7 +136,12 @@ def load_tensor_remote(
     else:
         tensor = torch.frombuffer(bytearray(r.content), dtype=torch_dtype)
 
-    return tensor.reshape(shape).float()
+    result = tensor.reshape(shape).float()
+
+    # ── 调试：打印结果首行 ────────────────────────
+    print(f"  result[0,:5]={result[0,:5].tolist()}\n")
+
+    return result
 
 
 # ─────────────────────────────────────────────
