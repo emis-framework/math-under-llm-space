@@ -859,10 +859,11 @@ with gr.Blocks(title="Wang's Five Laws — LLM Spectral Analyzer") as demo:
                     ### ✅ 推荐模型
                     ```
                     google/gemma-4-e2b
+                    google/gemma-4-e4b-it
                     google/gemma-4-31b-it
                     Qwen/Qwen2.5-14B-Instruct
-                    meta-llama/Llama-3-8B
                     deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
+                    meta-llama/Meta-Llama-3-8B
                     ```
                     ### 层号说明
                     - 层号 = safetensors key 中 `layers.{N}` 的 **N**
