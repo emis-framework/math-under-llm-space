@@ -82,9 +82,17 @@ def analyze_layer(
     records: list[dict] = []
     lines:   list[str]  = []
 
-    kv_tag = " [K=V共享]" if kv_shared else ""
+    # ── 调试：打印整体 shape ──────────────────────
     lines.append(
         f"\n{'─'*80}\n"
+        f"[DEBUG] W_q={list(W_q.shape)} W_k={list(W_k.shape)} "
+        f"W_v={list(W_v.shape)}\n"
+        f"[DEBUG] n_q={n_q} n_kv={n_kv} group={group} "
+        f"d_head={d_head} source={profile.head_dim_source}\n"
+    )
+
+    kv_tag = " [K=V共享]" if kv_shared else ""
+    lines.append(
         f"[{profile.prefix}] Layer {profile.layer_idx:3d}{kv_tag}  "
         f"n_q={n_q} n_kv={n_kv} group={group} "
         f"d_head={d_head}({profile.head_dim_source})\n"
@@ -107,6 +115,16 @@ def analyze_layer(
         smxk, smnk, cond_k = sigma_stats(s_k)
         smxv, smnv, cond_v = sigma_stats(s_v)
 
+        # ── 调试：打印每个 KV 头的切片和奇异值 ──────
+        lines.append(
+            f"[DEBUG] KV头{kv_h}: "
+            f"k_t={list(k_t.shape)} "
+            f"s_k前5={s_k[:5].tolist()}\n"
+            f"[DEBUG] KV头{kv_h}: "
+            f"v_t={list(v_t.shape)} "
+            f"s_v前5={s_v[:5].tolist()}\n"
+        )
+
         # KV 指标
         if kv_shared:
             ssr_kv   = 0.0
@@ -116,11 +134,11 @@ def analyze_layer(
             alpha_kv = 1.0
             res_kv   = 0.0
         else:
-            n_kv_sv  = min(len(s_k), len(s_v))
-            ssr_kv   = ssr(s_k, s_v)
-            pkv      = pearson(s_k[:n_kv_sv], s_v[:n_kv_sv])
-            cosU_KV  = cos_U(U_k, U_v)
-            cosV_KV  = cos_V(Vt_k, Vt_v)
+            n_kv_sv       = min(len(s_k), len(s_v))
+            ssr_kv        = ssr(s_k, s_v)
+            pkv           = pearson(s_k[:n_kv_sv], s_v[:n_kv_sv])
+            cosU_KV       = cos_U(U_k, U_v)
+            cosV_KV       = cos_V(Vt_k, Vt_v)
             alpha_kv, res_kv = svr(s_k, s_v)
 
         for q_off in range(group):
@@ -129,6 +147,13 @@ def analyze_layer(
             U_q, s_q, Vt_q = torch.linalg.svd(q_t, full_matrices=False)
 
             smxq, smnq, cond_q = sigma_stats(s_q)
+
+            # ── 调试：打印每个 Q 头的切片和奇异值 ────
+            lines.append(
+                f"[DEBUG]   Q头{h}: "
+                f"q_t={list(q_t.shape)} "
+                f"s_q前5={s_q[:5].tolist()}\n"
+            )
 
             nqk = min(len(s_q), len(s_k))
             nqv = min(len(s_q), len(s_v))
@@ -148,37 +173,40 @@ def analyze_layer(
             cU_QV      = cos_U(U_q, U_v)
             cV_QV      = cos_V(Vt_q, Vt_v)
 
+            # ── 调试：打印关键指标 ────────────────────
+            lines.append(
+                f"[DEBUG]   Q头{h}: "
+                f"pearson={pqk:+.4f} "
+                f"alpha_QK={a_qk:.4f} "
+                f"s_q[0]={s_q[0]:.4f} "
+                f"s_k[0]={s_k[0]:.4f}\n"
+            )
+
             records.append({
                 "prefix":        profile.prefix,
                 "layer":         profile.layer_idx,
                 "kv_head":       kv_h,
                 "q_head":        h,
                 "kv_shared":     kv_shared,
-                # 第一定律
                 "pearson_QK":    round(pqk,    6),
                 "spearman_QK":   round(spqk,   6),
                 "pearson_QV":    round(pqv,    6),
                 "pearson_KV":    round(pkv,    6),
-                # 第二定律
                 "ssr_QK":        round(ssr_qk,  8),
                 "ssr_QV":        round(ssr_qv,  8),
                 "ssr_KV":        round(ssr_kv,  8),
-                # 第四定律
                 "cosU_QK":       round(cU_QK,   6),
                 "cosU_QV":       round(cU_QV,   6),
                 "cosU_KV":       round(cosU_KV, 6),
-                # 第五定律
                 "cosV_QK":       round(cV_QK,   6),
                 "cosV_QV":       round(cV_QV,   6),
                 "cosV_KV":       round(cosV_KV, 6),
-                # 尺度因子 + 最小二乘残差
                 "alpha_QK":      round(a_qk,    4),
                 "alpha_QV":      round(a_qv,    4),
                 "alpha_KV":      round(alpha_kv,4),
                 "alpha_res_QK":  round(r_qk,    6),
                 "alpha_res_QV":  round(r_qv,    6),
                 "alpha_res_KV":  round(res_kv,  6),
-                # 第三定律：奇异值范围 + 条件数
                 "sigma_max_Q":   round(smxq, 4),
                 "sigma_min_Q":   round(smnq, 4),
                 "sigma_max_K":   round(smxk, 4),
@@ -188,7 +216,6 @@ def analyze_layer(
                 "cond_Q":        round(cond_q, 2),
                 "cond_K":        round(cond_k, 2),
                 "cond_V":        round(cond_v, 2),
-                # 维度信息
                 "head_dim":      d_head,
                 "d_model":       profile.d_model,
                 "n_q_heads":     n_q,
