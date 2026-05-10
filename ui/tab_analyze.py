@@ -28,12 +28,12 @@ from core.metrics import analyze_layer, summarize_records
 
 SIDEBAR_MD = """
 ### ✅ 推荐模型
-google/gemma-4-e2b
-google/gemma-4-e4b-it
-google/gemma-4-31b-it
-Qwen/Qwen2.5-14B-Instruct
-deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
-meta-llama/Meta-Llama-3-8B
+google/gemma-4-e2b  
+google/gemma-4-e4b-it  
+google/gemma-4-31b-it  
+Qwen/Qwen2.5-14B-Instruct  
+deepseek-ai/DeepSeek-R1-Distill-Qwen-14B  
+meta-llama/Meta-Llama-3-8B  
 
 
 ### 层号说明
