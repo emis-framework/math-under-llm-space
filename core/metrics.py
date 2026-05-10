@@ -105,6 +105,29 @@ def analyze_layer(
         f" {'α_QK':>7} {'α_QV':>7} {'α_KV':>7}\n"
     )
 
+    # 打印 W_k 每个 d_head 块的 L2 norm，看能量分布
+    lines.append(f"[DEBUG] W_k 各头能量（行块 L2 norm）:\n")
+    for i in range(n_kv):
+        block = W_k[i * d_head:(i + 1) * d_head, :]
+        norm  = float(block.norm())
+        # 同时打印该块的最大奇异值
+        s_tmp = torch.linalg.svd(block, full_matrices=False)[1]
+        lines.append(
+            f"  KV头{i:2d}: block_norm={norm:.2f}  "
+            f"sigma_max={float(s_tmp[0]):.4f}\n"
+        )
+
+    lines.append(f"[DEBUG] W_q 各头能量:\n")
+    for i in range(n_q):
+        block = W_q[i * d_head:(i + 1) * d_head, :]
+        norm  = float(block.norm())
+        s_tmp = torch.linalg.svd(block, full_matrices=False)[1]
+        lines.append(
+            f"  Q头{i:2d}: block_norm={norm:.2f}  "
+            f"sigma_max={float(s_tmp[0]):.4f}\n"
+        )
+
+
     for kv_h in range(n_kv):
         k_t = W_k[kv_h * d_head:(kv_h + 1) * d_head, :]
         v_t = W_v[kv_h * d_head:(kv_h + 1) * d_head, :]
