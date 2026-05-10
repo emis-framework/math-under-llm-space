@@ -82,17 +82,22 @@ def analyze_layer(
     records: list[dict] = []
     lines:   list[str]  = []
 
-    # ── 调试：打印整体 shape ──────────────────────
+    # ── 调试：打印整体信息 + 原始权重首行 ──────────
     lines.append(
-        f"\n{'─'*80}\n"
-        f"[DEBUG] W_q={list(W_q.shape)} W_k={list(W_k.shape)} "
-        f"W_v={list(W_v.shape)}\n"
-        f"[DEBUG] n_q={n_q} n_kv={n_kv} group={group} "
-        f"d_head={d_head} source={profile.head_dim_source}\n"
+        f"\n[DEBUG] ═══════════════════════════════\n"
+        f"[DEBUG] key_q = {profile.q.key}\n"
+        f"[DEBUG] key_k = {profile.k.key}\n"
+        f"[DEBUG] key_v = {profile.v.key if profile.v else 'K=V shared'}\n"
+        f"[DEBUG] W_q={list(W_q.shape)} W_k={list(W_k.shape)} W_v={list(W_v.shape)}\n"
+        f"[DEBUG] n_q={n_q} n_kv={n_kv} group={group} d_head={d_head}\n"
+        f"[DEBUG] W_k[0, :10] = {W_k[0, :10].tolist()}\n"
+        f"[DEBUG] W_q[0, :10] = {W_q[0, :10].tolist()}\n"
+        f"[DEBUG] ═══════════════════════════════\n"
     )
 
     kv_tag = " [K=V共享]" if kv_shared else ""
     lines.append(
+        f"\n{'─'*80}\n"
         f"[{profile.prefix}] Layer {profile.layer_idx:3d}{kv_tag}  "
         f"n_q={n_q} n_kv={n_kv} group={group} "
         f"d_head={d_head}({profile.head_dim_source})\n"
@@ -105,29 +110,6 @@ def analyze_layer(
         f" {'α_QK':>7} {'α_QV':>7} {'α_KV':>7}\n"
     )
 
-    # 打印 W_k 每个 d_head 块的 L2 norm，看能量分布
-    lines.append(f"[DEBUG] W_k 各头能量（行块 L2 norm）:\n")
-    for i in range(n_kv):
-        block = W_k[i * d_head:(i + 1) * d_head, :]
-        norm  = float(block.norm())
-        # 同时打印该块的最大奇异值
-        s_tmp = torch.linalg.svd(block, full_matrices=False)[1]
-        lines.append(
-            f"  KV头{i:2d}: block_norm={norm:.2f}  "
-            f"sigma_max={float(s_tmp[0]):.4f}\n"
-        )
-
-    lines.append(f"[DEBUG] W_q 各头能量:\n")
-    for i in range(n_q):
-        block = W_q[i * d_head:(i + 1) * d_head, :]
-        norm  = float(block.norm())
-        s_tmp = torch.linalg.svd(block, full_matrices=False)[1]
-        lines.append(
-            f"  Q头{i:2d}: block_norm={norm:.2f}  "
-            f"sigma_max={float(s_tmp[0]):.4f}\n"
-        )
-
-
     for kv_h in range(n_kv):
         k_t = W_k[kv_h * d_head:(kv_h + 1) * d_head, :]
         v_t = W_v[kv_h * d_head:(kv_h + 1) * d_head, :]
@@ -138,14 +120,13 @@ def analyze_layer(
         smxk, smnk, cond_k = sigma_stats(s_k)
         smxv, smnv, cond_v = sigma_stats(s_v)
 
-        # ── 调试：打印每个 KV 头的切片和奇异值 ──────
+        # ── 调试：KV头切片首行原始权重 ──────────────
         lines.append(
             f"[DEBUG] KV头{kv_h}: "
             f"k_t={list(k_t.shape)} "
-            f"s_k前5={s_k[:5].tolist()}\n"
+            f"s_k前5={[round(x,4) for x in s_k[:5].tolist()]}\n"
             f"[DEBUG] KV头{kv_h}: "
-            f"v_t={list(v_t.shape)} "
-            f"s_v前5={s_v[:5].tolist()}\n"
+            f"k_t[0,:10]={k_t[0, :10].tolist()}\n"
         )
 
         # KV 指标
@@ -171,17 +152,18 @@ def analyze_layer(
 
             smxq, smnq, cond_q = sigma_stats(s_q)
 
-            # ── 调试：打印每个 Q 头的切片和奇异值 ────
+            # ── 调试：Q头切片首行原始权重 ────────────
             lines.append(
                 f"[DEBUG]   Q头{h}: "
                 f"q_t={list(q_t.shape)} "
-                f"s_q前5={s_q[:5].tolist()}\n"
+                f"s_q前5={[round(x,4) for x in s_q[:5].tolist()]}\n"
+                f"[DEBUG]   Q头{h}: "
+                f"q_t[0,:10]={q_t[0, :10].tolist()}\n"
             )
 
             nqk = min(len(s_q), len(s_k))
             nqv = min(len(s_q), len(s_v))
 
-            # QK
             pqk        = pearson(s_q[:nqk], s_k[:nqk])
             spqk       = spearman_r(s_q[:nqk], s_k[:nqk])
             ssr_qk     = ssr(s_q, s_k)
@@ -189,21 +171,11 @@ def analyze_layer(
             cU_QK      = cos_U(U_q, U_k)
             cV_QK      = cos_V(Vt_q, Vt_k)
 
-            # QV
             pqv        = pearson(s_q[:nqv], s_v[:nqv])
             ssr_qv     = ssr(s_q, s_v)
             a_qv, r_qv = svr(s_q, s_v)
             cU_QV      = cos_U(U_q, U_v)
             cV_QV      = cos_V(Vt_q, Vt_v)
-
-            # ── 调试：打印关键指标 ────────────────────
-            lines.append(
-                f"[DEBUG]   Q头{h}: "
-                f"pearson={pqk:+.4f} "
-                f"alpha_QK={a_qk:.4f} "
-                f"s_q[0]={s_q[0]:.4f} "
-                f"s_k[0]={s_k[0]:.4f}\n"
-            )
 
             records.append({
                 "prefix":        profile.prefix,
