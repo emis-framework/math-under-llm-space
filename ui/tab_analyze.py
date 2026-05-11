@@ -11,6 +11,7 @@ import gradio as gr
 import requests
 import pandas as pd
 import numpy as np
+from core.debug import dlog
 
 from core.fetcher import (
     load_all_shard_headers,
@@ -174,6 +175,16 @@ def run_analysis(
 
             q_hdr, q_hs = all_headers[prof.q.shard]
             k_hdr, k_hs = all_headers[prof.k.shard]
+
+            dlog(log,
+                f"Layer {idx}:\n"
+                f"  q: {prof.q.shard} → {prof.q.key}\n"
+                f"  k: {prof.k.shard} → {prof.k.key}\n"
+                f"  v: {prof.v.shard + ' → ' + prof.v.key if prof.v else 'K=V shared'}\n"
+                f"  k_header_size={k_hs}\n"
+                f"  k_offsets={k_hdr[prof.k.key]['data_offsets']}\n"
+                f"  k_abs_start={8 + k_hs + k_hdr[prof.k.key]['data_offsets'][0]}"
+            )
 
             W_q = load_tensor_remote(q_url, prof.q.key, q_hdr, q_hs, token)
             W_k = load_tensor_remote(k_url, prof.k.key, k_hdr, k_hs, token)

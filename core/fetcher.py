@@ -9,6 +9,8 @@ import json
 import requests
 import torch
 from huggingface_hub import list_repo_files
+from core.debug import dprint
+
 
 # ─────────────────────────────────────────────
 # dtype 映射
@@ -102,7 +104,7 @@ def load_tensor_remote(
     expected_elems = 1
     for d in shape:
         expected_elems *= d
-    print(
+    dprint(
         f"[FETCH] {tensor_name}\n"
         f"  shape={shape} dtype={dtype_str}\n"
         f"  data_offsets={offsets}\n"
@@ -123,7 +125,7 @@ def load_tensor_remote(
 
     # ── 调试：打印实际收到的字节数 ────────────────
     actual_bytes = len(r.content)
-    print(
+    dprint(
         f"  actual_bytes={actual_bytes} "
         f"{'✅' if actual_bytes == expected_bytes else '❌ 字节数不匹配!'}\n"
         f"  前8字节(hex)={r.content[:8].hex()}\n"
@@ -139,7 +141,7 @@ def load_tensor_remote(
     result = tensor.reshape(shape).float()
 
     # ── 调试：打印结果首行 ────────────────────────
-    print(f"  result[0,:5]={result[0,:5].tolist()}\n")
+    dprint(f"  result[0,:5]={result[0,:5].tolist()}\n")
 
     return result
 

@@ -3,6 +3,7 @@ import torch
 import numpy as np
 from scipy.stats import spearmanr
 from core.layer_profile import LayerProfile
+from core.debug import dlog
 
 
 def pearson(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -83,17 +84,16 @@ def analyze_layer(
     lines:   list[str]  = []
 
     # ── 调试：打印整体信息 + 原始权重首行 ──────────
-    lines.append(
-        f"\n[DEBUG] ═══════════════════════════════\n"
-        f"[DEBUG] key_q = {profile.q.key}\n"
-        f"[DEBUG] key_k = {profile.k.key}\n"
-        f"[DEBUG] key_v = {profile.v.key if profile.v else 'K=V shared'}\n"
-        f"[DEBUG] W_q={list(W_q.shape)} W_k={list(W_k.shape)} W_v={list(W_v.shape)}\n"
-        f"[DEBUG] n_q={n_q} n_kv={n_kv} group={group} d_head={d_head}\n"
-        f"[DEBUG] W_k[0, :10] = {W_k[0, :10].tolist()}\n"
-        f"[DEBUG] W_q[0, :10] = {W_q[0, :10].tolist()}\n"
-        f"[DEBUG] ═══════════════════════════════\n"
-    )
+    # ── Debug：整体信息 ───────────────────────
+    dlog(lines, f"═══════════════════════════════")
+    dlog(lines, f"key_q = {profile.q.key}")
+    dlog(lines, f"key_k = {profile.k.key}")
+    dlog(lines, f"key_v = {profile.v.key if profile.v else 'K=V shared'}")
+    dlog(lines, f"W_q={list(W_q.shape)} W_k={list(W_k.shape)} W_v={list(W_v.shape)}")
+    dlog(lines, f"n_q={n_q} n_kv={n_kv} group={group} d_head={d_head} source={profile.head_dim_source}")
+    dlog(lines, f"W_k[0,:10] = {W_k[0, :10].tolist()}")
+    dlog(lines, f"W_q[0,:10] = {W_q[0, :10].tolist()}")
+    dlog(lines, f"═══════════════════════════════")
 
     kv_tag = " [K=V共享]" if kv_shared else ""
     lines.append(
@@ -121,13 +121,12 @@ def analyze_layer(
         smxv, smnv, cond_v = sigma_stats(s_v)
 
         # ── 调试：KV头切片首行原始权重 ──────────────
-        lines.append(
-            f"[DEBUG] KV头{kv_h}: "
-            f"k_t={list(k_t.shape)} "
-            f"s_k前5={[round(x,4) for x in s_k[:5].tolist()]}\n"
-            f"[DEBUG] KV头{kv_h}: "
-            f"k_t[0,:10]={k_t[0, :10].tolist()}\n"
+        # ── Debug：KV 头 ──────────────────────
+        dlog(lines,
+            f"KV头{kv_h}: k_t={list(k_t.shape)} "
+            f"s_k前5={[round(x,4) for x in s_k[:5].tolist()]}"
         )
+        dlog(lines, f"KV头{kv_h}: k_t[0,:10]={k_t[0, :10].tolist()}")
 
         # KV 指标
         if kv_shared:
@@ -153,13 +152,12 @@ def analyze_layer(
             smxq, smnq, cond_q = sigma_stats(s_q)
 
             # ── 调试：Q头切片首行原始权重 ────────────
-            lines.append(
-                f"[DEBUG]   Q头{h}: "
-                f"q_t={list(q_t.shape)} "
-                f"s_q前5={[round(x,4) for x in s_q[:5].tolist()]}\n"
-                f"[DEBUG]   Q头{h}: "
-                f"q_t[0,:10]={q_t[0, :10].tolist()}\n"
+            # ── Debug：Q 头 ───────────────────
+            dlog(lines,
+                f"  Q头{h}: q_t={list(q_t.shape)} "
+                f"s_q前5={[round(x,4) for x in s_q[:5].tolist()]}"
             )
+            dlog(lines, f"  Q头{h}: q_t[0,:10]={q_t[0, :10].tolist()}")
 
             nqk = min(len(s_q), len(s_k))
             nqv = min(len(s_q), len(s_v))
@@ -176,6 +174,13 @@ def analyze_layer(
             a_qv, r_qv = svr(s_q, s_v)
             cU_QV      = cos_U(U_q, U_v)
             cV_QV      = cos_V(Vt_q, Vt_v)
+
+            # ── Debug：关键指标 ───────────────
+            dlog(lines,
+                f"  Q头{h}: pearson={pqk:+.4f} "
+                f"alpha_QK={a_qk:.4f} "
+                f"s_q[0]={s_q[0]:.4f} s_k[0]={s_k[0]:.4f}"
+            )
 
             records.append({
                 "prefix":        profile.prefix,
