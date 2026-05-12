@@ -10,6 +10,7 @@ import sqlite3
 import numpy as np
 from datetime import datetime
 from db.schema import get_connection, init_db
+import os
 
 
 # ─────────────────────────────────────────────
@@ -373,3 +374,30 @@ def update_model_summary(
         )
 
     conn.commit()
+
+# 在 db/writer.py 末尾追加
+
+
+
+# ─────────────────────────────────────────────
+# 写入权限验证
+# ─────────────────────────────────────────────
+
+def check_write_permission(admin_token: str) -> bool:
+    """
+    验证管理员写入权限。
+    
+    原理：
+    - WRITE_TOKEN 存储在 HF Space Secrets（加密，不进入 git repo）
+    - 运行时由 HF 注入为环境变量
+    - 只在服务端比对，不返回给前端
+    
+    返回：
+    - True  = 有写入权限
+    - False = 只读模式（分析可以跑，结果不写库）
+    """
+    server_token = os.environ.get("WRITE_TOKEN", "")
+    if not server_token:
+        # 服务端未配置 WRITE_TOKEN → 拒绝所有写入
+        return False
+    return admin_token.strip() == server_token
