@@ -5,13 +5,23 @@ Wang's Five Laws — LLM Spectral Analyzer
 """
 
 import gradio as gr
+from db.schema import init_db
 from ui.tab_inspect import build_tab_inspect
 from ui.tab_analyze import build_tab_analyze
+from ui.tab_leaderboard import build_tab_leaderboard
+from ui.tab_database import build_tab_database
 
+# ── 启动时初始化数据库 ────────────────────────
+# 幂等操作，重复调用安全
+# /data 目录由 HF Space bucket 挂载，重启后数据不丢失
+init_db()
+
+# ─────────────────────────────────────────────
+# 主界面
+# ─────────────────────────────────────────────
 
 with gr.Blocks(
     title="Wang's Five Laws — LLM Spectral Analyzer",
-    # theme=gr.themes.Soft()
 ) as demo:
 
     gr.Markdown("""
@@ -20,7 +30,7 @@ with gr.Blocks(
 
     通过 **HTTP Range Request** 直接读取 HF 权重，**无需下载整个模型**。  
     自动识别模型结构（GQA / MHA / K=V共享 / 异构head_dim），  
-    逐头计算王氏五定律全部指标。
+    逐头计算王氏五定律全部指标，结果持久化到 SQLite。
 
     | 定律 | 指标 | 理论极值 |
     |------|------|---------|
@@ -35,19 +45,30 @@ with gr.Blocks(
     [![Wang's Law](https://img.shields.io/badge/Wang%27s%20Law-r%3D1-blue)](https://github.com/emis-framework/math-under-llm)
     """)
 
-    # ── Tab1：结构探测 ────────────────────────────
-    inspect_model_id, inspect_token = build_tab_inspect()
+    with gr.Tabs():
+        # Tab1：结构探测
+        inspect_model_id, inspect_token = build_tab_inspect()
 
-    # ── Tab2：分析 ───────────────────────────────
-    analyze_model_id, analyze_token = build_tab_analyze()
+        # Tab2：分析（含数据库写入 + 断点续传）
+        analyze_model_id, analyze_token = build_tab_analyze()
 
-    # ── 后续 Tab（Phase 2 完成后接入）────────────
-    with gr.Tab("🏆 排行榜"):
-        gr.Markdown("*即将推出：王氏评分排行榜（基于 SSR 指标）*")
+        # Tab3：王氏评分排行榜
+        build_tab_leaderboard()
 
-    with gr.Tab("🗄️ 数据库"):
-        gr.Markdown("*即将推出：历史分析结果浏览与导出*")
+        # Tab4：数据库浏览
+        build_tab_database()
 
+    # ── Tab1 → Tab2 同步模型 ID 和 token ─────────
+    inspect_model_id.change(
+        fn=lambda x: x,
+        inputs=inspect_model_id,
+        outputs=analyze_model_id,
+    )
+    inspect_token.change(
+        fn=lambda x: x,
+        inputs=inspect_token,
+        outputs=analyze_token,
+    )
 
 if __name__ == "__main__":
     demo.launch()
