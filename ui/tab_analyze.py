@@ -4,15 +4,16 @@ Tab2：分析单个模型
 - 使用 LayerProfile 自动推断结构
 - start_layer / end_layer 按原始层号过滤
 - 逐头计算五定律全指标
-- 结果写入 SQLite（Phase 2 完成后接入）
+- 结果写入 SQLite（断点续传，以 prefix+layer 为粒度）
 """
 
 import gradio as gr
 import requests
 import pandas as pd
 import numpy as np
-from core.debug import dlog
+from datetime import datetime
 
+from core.debug import dlog
 from core.fetcher import (
     load_all_shard_headers,
     load_tensor_remote,
@@ -26,6 +27,16 @@ from core.layer_profile import (
 )
 from core.metrics import analyze_layer, summarize_records
 
+from db.schema import init_db
+from db.writer import (
+    upsert_model,
+    upsert_component,
+    write_layer_records,
+    update_model_summary,
+    get_analyzed_layers,
+    is_layer_complete,
+    infer_layer_type,
+)
 
 SIDEBAR_MD = """
 ### ✅ 推荐模型
@@ -35,7 +46,6 @@ google/gemma-4-31b-it
 Qwen/Qwen2.5-14B-Instruct  
 deepseek-ai/DeepSeek-R1-Distill-Qwen-14B  
 meta-llama/Meta-Llama-3-8B  
-
 
 ### 层号说明
 - 层号 = safetensors key 中 `layers.{N}` 的 **N**
@@ -74,11 +84,16 @@ def run_analysis(
     token   = hf_token.strip() or None
     start_l = int(start_layer)
     end_l   = int(end_layer)
-    log     = [
+    t_start = datetime.utcnow()
+
+    log = [
         f"🔍 分析：{model_id}  层 {start_l}~{end_l}\n"
         f"{'═'*80}\n"
     ]
     all_records: list[dict] = []
+
+    # ── 初始化数据库连接 ──────────────────────────
+    conn = init_db()
 
     # ── 量化检测 ─────────────────────────────────
     progress(0.02, desc="量化检测...")
@@ -90,6 +105,7 @@ def run_analysis(
     # ── config.json ───────────────────────────────
     progress(0.05, desc="读取 config...")
     config_params = {}
+    config_raw    = {}
     try:
         r = requests.get(
             f"https://huggingface.co/{model_id}/resolve/main/config.json",
@@ -97,7 +113,8 @@ def run_analysis(
             timeout=15
         )
         if r.status_code == 200:
-            config_params = extract_config_params(r.json())
+            config_raw    = r.json()
+            config_params = extract_config_params(config_raw)
             log.append(
                 f"📋 config：model_type={config_params.get('model_type')}  "
                 f"head_dim={config_params.get('head_dim')}\n"
@@ -105,6 +122,10 @@ def run_analysis(
             )
     except Exception:
         log.append("⚠️  无法读取 config.json\n")
+
+    # ── 写入模型元数据 ────────────────────────────
+    model_type = config_params.get("model_type", "unknown")
+    upsert_model(conn, model_id, model_type=model_type)
 
     # ── 读取所有 shard headers ────────────────────
     progress(0.08, desc="读取 shard headers...")
@@ -127,6 +148,34 @@ def run_analysis(
     if not profiles:
         return "".join(log) + "⚠️ 未发现任何 Q/K/V 层\n", None
 
+    # ── 按组件写入 components 表 ──────────────────
+    # 按 prefix 分组，统计组件信息
+    by_prefix: dict[str, list] = {}
+    for (pfx, idx), prof in profiles.items():
+        by_prefix.setdefault(pfx, []).append(prof)
+
+    for pfx, profs in by_prefix.items():
+        complete_profs = [p for p in profs if p.complete]
+        if not complete_profs:
+            continue
+
+        head_dims  = [p.head_dim for p in complete_profs]
+        has_shared = any(p.kv_shared for p in complete_profs)
+        has_global = has_shared   # kv_shared=True → global 层
+        d_models   = [p.d_model for p in complete_profs if p.d_model > 0]
+
+        upsert_component(
+            conn         = conn,
+            model_id     = model_id,
+            prefix       = pfx,
+            n_layers     = len(complete_profs),
+            head_dim_min = min(head_dims),
+            head_dim_max = max(head_dims),
+            has_kv_shared= has_shared,
+            has_global   = has_global,
+            d_model      = d_models[0] if d_models else 0,
+        )
+
     # ── 按原始层号过滤 ────────────────────────────
     filtered = {
         (pfx, idx): prof
@@ -135,13 +184,12 @@ def run_analysis(
     }
 
     if not filtered:
-        # 打印实际层号供参考
-        by_pfx: dict[str, list] = {}
+        by_pfx_all: dict[str, list] = {}
         for (pfx, idx) in profiles:
-            by_pfx.setdefault(pfx, []).append(idx)
+            by_pfx_all.setdefault(pfx, []).append(idx)
         info = "\n".join(
             f"  '{p}': {sorted(v)}"
-            for p, v in sorted(by_pfx.items())
+            for p, v in sorted(by_pfx_all.items())
         )
         return (
             "".join(log) +
@@ -149,26 +197,50 @@ def run_analysis(
             f"实际层号：\n{info}\n", None
         )
 
-    # 打印将分析的层
+    # ── 断点续传：查询已完成层 ────────────────────
+    # 按 prefix 分别查询
+    done_layers: dict[str, set] = {}
+    for pfx in set(pfx for pfx, _ in filtered):
+        done_layers[pfx] = get_analyzed_layers(conn, model_id, pfx)
+
+    # 打印将分析的层（含断点续传状态）
     by_pfx2: dict[str, list] = {}
     for (pfx, idx) in filtered:
         by_pfx2.setdefault(pfx, []).append(idx)
-    log.append(f"📐 将分析：\n")
+
+    log.append("📐 将分析：\n")
+    skipped_total = 0
     for pfx, idxs in sorted(by_pfx2.items()):
-        log.append(f"  '{pfx}' → 层 {sorted(idxs)}\n")
+        done  = done_layers.get(pfx, set())
+        todo  = [i for i in sorted(idxs) if i not in done]
+        skip  = [i for i in sorted(idxs) if i in done]
+        skipped_total += len(skip)
+        log.append(f"  '{pfx}'\n")
+        log.append(f"    待分析：{todo}\n")
+        if skip:
+            log.append(f"    已跳过（断点续传）：{skip}\n")
     log.append(f"{'═'*80}\n")
+
+    if skipped_total > 0:
+        log.append(f"⚡ 断点续传：跳过 {skipped_total} 层（已有数据）\n")
 
     # ── 逐层分析 ─────────────────────────────────
     sorted_items = sorted(filtered.items(), key=lambda x: (x[0][0], x[0][1]))
     total = len(sorted_items)
 
     for i, ((pfx, idx), prof) in enumerate(sorted_items):
+
+        # 断点续传：该层已完成则跳过
+        if idx in done_layers.get(pfx, set()):
+            # 从数据库读取已有记录加入 all_records（用于最终展示）
+            continue
+
         progress(
             0.15 + 0.80 * i / max(total, 1),
             desc=f"{pfx.split('.')[-2] if '.' in pfx else pfx} L{idx}..."
         )
 
-        # 加载 Q/K/V
+        # ── 加载 Q/K/V ────────────────────────────
         try:
             q_url = get_file_url(model_id, prof.q.shard)
             k_url = get_file_url(model_id, prof.k.shard)
@@ -190,7 +262,6 @@ def run_analysis(
             W_k = load_tensor_remote(k_url, prof.k.key, k_hdr, k_hs, token)
 
             if prof.kv_shared:
-                # K=V 共享：直接复用
                 W_v = W_k.clone()
             else:
                 v_url = get_file_url(model_id, prof.v.shard)
@@ -205,22 +276,47 @@ def run_analysis(
             log.append(f"[{pfx}] Layer {idx}: ⚠️ tensor 为 None\n")
             continue
 
-        # 计算五定律
+        # ── 计算五定律 ────────────────────────────
         try:
             records, layer_log = analyze_layer(W_q, W_k, W_v, prof)
             all_records.extend(records)
             log.append(layer_log)
+
+            # ── 写入数据库 ────────────────────────
+            if records:
+                write_layer_records(conn, model_id, records)
+                # 每层写完立刻更新 summary（支持中途查看排行榜）
+                update_model_summary(conn, model_id, pfx)
+                log.append(
+                    f"  ✅ 已写库：{len(records)} 条记录 "
+                    f"[{pfx}] Layer {idx}\n"
+                )
+
         except Exception as e:
             log.append(f"[{pfx}] Layer {idx}: ❌ 计算失败：{e}\n")
         finally:
             del W_q, W_k, W_v
 
+    # ── 更新分析耗时 ──────────────────────────────
+    elapsed = (datetime.utcnow() - t_start).total_seconds()
+    conn.execute(
+        "UPDATE models SET analyze_sec = ? WHERE model_id = ?",
+        (elapsed, model_id)
+    )
+    conn.commit()
+
     # ── 汇总 ─────────────────────────────────────
     if not all_records:
-        return "".join(log) + "\n❌ 未获得任何有效结果\n", None
+        # 可能全部是断点续传跳过的
+        log.append(
+            "\n⚡ 所有层均已完成（断点续传），"
+            "请到「排行榜」或「数据库」Tab 查看结果\n"
+        )
+        return "".join(log), None
 
     summary = summarize_records(all_records, model_id)
     log.append(summary)
+    log.append(f"\n⏱️ 本次耗时：{elapsed:.1f} 秒\n")
 
     df = pd.DataFrame(all_records)
     return "".join(log), df
@@ -233,8 +329,9 @@ def run_analysis(
 def build_tab_analyze():
     with gr.Tab("📊 分析"):
         gr.Markdown("""
-        **第二步：选择层范围，计算王氏五定律全指标**
-        层号 = safetensors key 中 `layers.{N}` 的原始 N，K=V 共享层自动处理。
+        **第二步：选择层范围，计算王氏五定律全指标**  
+        层号 = safetensors key 中 `layers.{N}` 的原始 N，K=V 共享层自动处理。  
+        ⚡ **支持断点续传**：已分析的层自动跳过，随时中断随时继续。
         """)
 
         with gr.Row():
