@@ -202,25 +202,24 @@ def _migrate_add_modality(conn: sqlite3.Connection):
 # ─────────────────────────────────────────────
 
 def init_db() -> sqlite3.Connection:
-    """
-    初始化数据库：建表 + 建索引 + 迁移旧数据
-    幂等操作，重复调用安全
-    """
     conn = get_connection()
     cur  = conn.cursor()
 
+    # 第一步：建表
     cur.execute(SQL_CREATE_MODELS)
     cur.execute(SQL_CREATE_COMPONENTS)
     cur.execute(SQL_CREATE_LAYER_HEAD_METRICS)
     cur.execute(SQL_CREATE_MODEL_SUMMARY)
-
-    for sql in SQL_CREATE_INDEXES:
-        cur.execute(sql)
-
     conn.commit()
 
-    # 旧数据库迁移（新库此函数为空操作）
+    # 第二步：迁移旧数据（加 modality 列）← 必须在建索引之前
     _migrate_add_modality(conn)
+
+    # 第三步：建索引（此时 modality 列已确保存在）
+    cur = conn.cursor()
+    for sql in SQL_CREATE_INDEXES:
+        cur.execute(sql)
+    conn.commit()
 
     return conn
 

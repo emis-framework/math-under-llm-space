@@ -69,7 +69,7 @@ def load_leaderboard(
 
 def build_tab_leaderboard():
     with gr.Tab("🏆 Leaderboard"):
-        gr.Markdown("""
+        gr.Markdown(r"""
         ## Wang's Five Laws — Model Leaderboard
 
         **Wang Score = 1 − median(SSR\_QK)**  Higher is better. Theoretical max = 1.  
@@ -121,7 +121,7 @@ def build_tab_leaderboard():
             wrap=True,
         )
 
-        gr.Markdown("""
+        gr.Markdown(r"""
         ### Metric Reference | 指标说明
 
         | Metric | Description | Better |
