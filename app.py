@@ -10,10 +10,9 @@ from ui.tab_inspect import build_tab_inspect
 from ui.tab_analyze import build_tab_analyze
 from ui.tab_leaderboard import build_tab_leaderboard
 from ui.tab_database import build_tab_database
+from ui.tab_plot import build_tab_plot
 
 # ── 启动时初始化数据库 ────────────────────────
-# 幂等操作，重复调用安全
-# /data 目录由 HF Space bucket 挂载，重启后数据不丢失
 init_db()
 
 # ─────────────────────────────────────────────
@@ -57,6 +56,9 @@ with gr.Blocks(
 
         # Tab4：数据库浏览
         build_tab_database()
+
+        # Tab5：作图（论文级别）
+        build_tab_plot()
 
     # ── Tab1 → Tab2 同步模型 ID 和 token ─────────
     inspect_model_id.change(
