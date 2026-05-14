@@ -1,4 +1,4 @@
-# ui/tab_plot.py
+# ui/tab_plot.py 
 """
 Tab5: Plot — Publication-quality figure generation
 - Plotly native  → interactive browser preview (12×1, full-width, fast)
