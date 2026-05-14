@@ -1,9 +1,11 @@
 # ui/tab_plot.py
 """
 Tab5: Plot — Publication-quality figure generation
-- matplotlib → PNG / PDF / SVG export (300 dpi, paper-ready)
-- Plotly native → interactive browser preview (12×1, full-width, fast)
-Two completely independent rendering paths, no conversion between them.
+- Plotly native  → interactive browser preview (12×1, full-width, fast)
+- matplotlib     → PNG / PDF / SVG export (300 dpi, paper-ready)
+
+NO nested gr.Tabs() — avoids Gradio rendering bugs with Accordion+Tabs nesting.
+Two side-by-side buttons instead: ⚡ Interactive  |  🖨️ Export
 """
 
 import os
@@ -82,14 +84,13 @@ def _make_zip(paths: list) -> str | None:
 
 def gen_single_plotly(model_id, modality, start_l, end_l, show_band,
                       progress=gr.Progress()):
-    """Fast path: native Plotly, no matplotlib involved."""
     if not model_id:
         return None, "Please select a model."
     progress(0.2, desc="Loading data from DB...")
     df = _load_df(model_id, modality, start_l, end_l)
     if df.empty:
         return None, f"No data for {model_id}. Run Tab 2 analysis first."
-    progress(0.7, desc="Building interactive figure...")
+    progress(0.7, desc="Building Plotly figure...")
     fig = plotly_single(df, _short(model_id), show_band=show_band)
     status = (
         f"✅ {model_id}  |  {df['layer'].nunique()} layers  "
@@ -101,33 +102,35 @@ def gen_single_plotly(model_id, modality, start_l, end_l, show_band,
 
 def gen_single_export(model_id, modality, start_l, end_l, show_band,
                       progress=gr.Progress()):
-    """Export path: matplotlib → PNG/PDF/SVG."""
     if not model_id:
-        return "Please select a model.", None, None, None, None
+        return "Please select a model.", None, None, None, None, None
     progress(0.15, desc="Loading data from DB...")
     df = _load_df(model_id, modality, start_l, end_l)
     if df.empty:
-        return f"No data for {model_id}.", None, None, None, None
+        return f"No data for {model_id}.", None, None, None, None, None
     head_dim, d_model = _infer_dims(df)
-    progress(0.40, desc="Rendering matplotlib figure (18x20 in, 300 dpi)...")
+    progress(0.40, desc="Rendering matplotlib figure (18×20 in, 300 dpi)...")
     import matplotlib.pyplot as plt
-    fig = plot_single_model(df, _short(model_id),
-                            show_band=show_band,
-                            head_dim=head_dim, d_model=d_model)
-    progress(0.75, desc="Saving PNG / PDF / SVG...")
+    fig = plot_single_model(
+        df, _short(model_id),
+        show_band=show_band,
+        head_dim=head_dim, d_model=d_model,
+    )
+    progress(0.78, desc="Saving PNG / PDF / SVG...")
     base  = _safe_path(f"single_{_short(model_id)}_L{int(start_l)}-{int(end_l)}")
     paths = save_figure(fig, base)
     plt.close(fig)
-    zip_p = _make_zip(paths)
+    zip_p  = _make_zip(paths)
     status = (
-        f"Exported: {', '.join(os.path.basename(p) for p in paths)}\n"
-        f"head_dim={head_dim}  d_model={d_model}"
+        f"✅ Exported: {', '.join(os.path.basename(p) for p in paths)}\n"
+        f"   head_dim={head_dim}  d_model={d_model}"
     )
     progress(1.0)
     png = paths[0] if len(paths) > 0 else None
     pdf = paths[1] if len(paths) > 1 else None
     svg = paths[2] if len(paths) > 2 else None
-    return status, png, pdf, svg, zip_p
+    # 6 values: status, preview(=png), png_dl, pdf_dl, svg_dl, zip
+    return status, png, png, pdf, svg, zip_p
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,7 +151,7 @@ def gen_compare_plotly(model_a, model_b, modality, start_l, end_l,
         return None, f"No data for Model A ({model_a})."
     if df_b.empty:
         return None, f"No data for Model B ({model_b})."
-    progress(0.65, desc="Building interactive comparison figure...")
+    progress(0.65, desc="Building Plotly comparison figure...")
     fig = plotly_compare(df_a, df_b, _short(model_a), _short(model_b),
                          show_band=show_band, show_delta=show_delta)
     status = (
@@ -162,12 +165,12 @@ def gen_compare_plotly(model_a, model_b, modality, start_l, end_l,
 def gen_compare_export(model_a, model_b, modality, start_l, end_l,
                        show_band, show_delta, progress=gr.Progress()):
     if not model_a or not model_b or model_a == model_b:
-        return "Select two different models.", None, None, None, None
+        return "Select two different models.", None, None, None, None, None
     progress(0.10, desc="Loading data...")
     df_a = _load_df(model_a, modality, start_l, end_l)
     df_b = _load_df(model_b, modality, start_l, end_l)
     if df_a.empty or df_b.empty:
-        return "Missing data for one or both models.", None, None, None, None
+        return "Missing data for one or both models.", None, None, None, None, None
     head_dim_a, d_model_a = _infer_dims(df_a)
     head_dim_b, d_model_b = _infer_dims(df_b)
     head_dim = (head_dim_a + head_dim_b) // 2
@@ -185,20 +188,21 @@ def gen_compare_export(model_a, model_b, modality, start_l, end_l,
     )
     paths = save_figure(fig, base)
     plt.close(fig)
-    zip_p = _make_zip(paths)
+    zip_p  = _make_zip(paths)
     status = (
-        f"Exported: {', '.join(os.path.basename(p) for p in paths)}\n"
-        f"head_dim≈{head_dim}  d_model≈{d_model}"
+        f"✅ Exported: {', '.join(os.path.basename(p) for p in paths)}\n"
+        f"   head_dim≈{head_dim}  d_model≈{d_model}"
     )
     progress(1.0)
     png = paths[0] if len(paths) > 0 else None
     pdf = paths[1] if len(paths) > 1 else None
     svg = paths[2] if len(paths) > 2 else None
-    return status, png, pdf, svg, zip_p
+    # 6 values: status, preview(=png), png_dl, pdf_dl, svg_dl, zip
+    return status, png, png, pdf, svg, zip_p
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tab5 UI
+# Tab5 UI  —  NO nested gr.Tabs() inside Accordion
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_tab_plot():
@@ -206,11 +210,10 @@ def build_tab_plot():
         gr.Markdown("""
         ## Wang's Five Laws — Figures
 
-        Two independent rendering paths:
-        | Path | Engine | Speed | Use for |
-        |------|--------|-------|---------|
-        | **Interactive** | Native Plotly, 12×1 full-width | Fast | Exploration, hover, zoom |
-        | **Export** | Matplotlib 18×20 in @ 300 dpi | Slower | Paper submission (PNG/PDF/SVG) |
+        | Button | Engine | Speed | Output |
+        |--------|--------|-------|--------|
+        | ⚡ **Interactive** | Native Plotly 12×1 full-width | ~2 s | In-page, hover/zoom |
+        | 🖨️ **Export** | Matplotlib 18×20 in @ 300 dpi | ~30 s | PNG · PDF · SVG download |
 
         > Run **Tab 2 (Analyze)** first to populate the database.
         """)
@@ -224,13 +227,14 @@ def build_tab_plot():
             start_l = gr.Number(value=0,  precision=0, label="Start Layer", scale=1)
             end_l   = gr.Number(value=47, precision=0, label="End Layer",   scale=1)
             show_band_chk = gr.Checkbox(
-                value=True, label="Show IQR band (head consistency)", scale=1
+                value=True, label="Show IQR band", scale=1
             )
 
         gr.Markdown("---")
 
         # ══ Single model ══════════════════════════════════════════════════════
         with gr.Accordion("📊 Single Model", open=True):
+
             choices = _get_model_choices()
             single_model = gr.Dropdown(
                 choices=choices,
@@ -240,39 +244,38 @@ def build_tab_plot():
                 info="Refresh page after new analysis to update this list.",
             )
 
-            with gr.Tabs():
-                # ── Interactive ───────────────────────────────────────────────
-                with gr.Tab("📉 Interactive (Plotly)"):
-                    single_plotly_btn = gr.Button(
-                        "⚡ Generate Interactive Figure", variant="primary"
-                    )
-                    single_plotly_status = gr.Textbox(
-                        lines=1, interactive=False, label="Status"
-                    )
-                    single_plotly_fig = gr.Plot(label=None)
+            # Two side-by-side buttons — no nested Tabs
+            with gr.Row():
+                single_plotly_btn = gr.Button(
+                    "⚡ Interactive (Plotly)", variant="primary", scale=1
+                )
+                single_export_btn = gr.Button(
+                    "🖨️ Export PNG / PDF / SVG", variant="secondary", scale=1
+                )
 
-                # ── Export ────────────────────────────────────────────────────
-                with gr.Tab("🖨️ Export (PNG / PDF / SVG)"):
-                    single_export_btn = gr.Button(
-                        "🖨️ Render & Export  (paper-quality, ~30 s)",
-                        variant="secondary"
-                    )
-                    single_export_status = gr.Textbox(
-                        lines=2, interactive=False, label="Export status"
-                    )
-                    single_preview = gr.Image(
-                        type="filepath", label="PNG preview", height=400
-                    )
-                    with gr.Row():
-                        dl_s_png = gr.File(label="⬇ PNG (300 dpi)")
-                        dl_s_pdf = gr.File(label="⬇ PDF (vector)")
-                        dl_s_svg = gr.File(label="⬇ SVG (vector)")
-                        dl_s_zip = gr.File(label="⬇ ZIP (all)")
+            single_status = gr.Textbox(
+                lines=2, interactive=False, label="Status"
+            )
+
+            # Interactive output — always visible, populated on demand
+            single_plotly_fig = gr.Plot(label="Interactive figure")
+
+            # Export outputs — always visible, populated on demand
+            gr.Markdown("#### 🖨️ Export outputs")
+            single_preview = gr.Image(
+                type="filepath", label="PNG preview (click to enlarge)", height=350
+            )
+            with gr.Row():
+                dl_s_png = gr.File(label="⬇ PNG (300 dpi)")
+                dl_s_pdf = gr.File(label="⬇ PDF (vector)")
+                dl_s_svg = gr.File(label="⬇ SVG (vector)")
+                dl_s_zip = gr.File(label="⬇ ZIP (all formats)")
 
         gr.Markdown("---")
 
         # ══ Two-model comparison ══════════════════════════════════════════════
         with gr.Accordion("📊 Two-Model Comparison", open=False):
+
             with gr.Row():
                 model_a = gr.Dropdown(
                     choices=choices,
@@ -290,66 +293,65 @@ def build_tab_plot():
                     value=True, label="Show Δ fill (B − A)", scale=1
                 )
 
-            with gr.Tabs():
-                with gr.Tab("📉 Interactive (Plotly)"):
-                    cmp_plotly_btn = gr.Button(
-                        "⚡ Generate Interactive Comparison", variant="primary"
-                    )
-                    cmp_plotly_status = gr.Textbox(
-                        lines=1, interactive=False, label="Status"
-                    )
-                    cmp_plotly_fig = gr.Plot(label=None)
+            with gr.Row():
+                cmp_plotly_btn = gr.Button(
+                    "⚡ Interactive (Plotly)", variant="primary", scale=1
+                )
+                cmp_export_btn = gr.Button(
+                    "🖨️ Export PNG / PDF / SVG", variant="secondary", scale=1
+                )
 
-                with gr.Tab("🖨️ Export (PNG / PDF / SVG)"):
-                    cmp_export_btn = gr.Button(
-                        "🖨️ Render & Export", variant="secondary"
-                    )
-                    cmp_export_status = gr.Textbox(
-                        lines=2, interactive=False, label="Export status"
-                    )
-                    cmp_preview = gr.Image(
-                        type="filepath", label="PNG preview", height=400
-                    )
-                    with gr.Row():
-                        dl_c_png = gr.File(label="⬇ PNG (300 dpi)")
-                        dl_c_pdf = gr.File(label="⬇ PDF (vector)")
-                        dl_c_svg = gr.File(label="⬇ SVG (vector)")
-                        dl_c_zip = gr.File(label="⬇ ZIP (all)")
+            cmp_status = gr.Textbox(
+                lines=2, interactive=False, label="Status"
+            )
+
+            cmp_plotly_fig = gr.Plot(label="Interactive comparison figure")
+
+            gr.Markdown("#### 🖨️ Export outputs")
+            cmp_preview = gr.Image(
+                type="filepath", label="PNG preview", height=350
+            )
+            with gr.Row():
+                dl_c_png = gr.File(label="⬇ PNG (300 dpi)")
+                dl_c_pdf = gr.File(label="⬇ PDF (vector)")
+                dl_c_svg = gr.File(label="⬇ SVG (vector)")
+                dl_c_zip = gr.File(label="⬇ ZIP (all formats)")
 
         gr.Markdown("""
         ---
         **Reading the figures**
-        - **IQR band** = 25%–75% quantile across attention heads per layer.
-          Narrow band → heads behave consistently → model is well-organized.
-        - **Dotted vertical lines** = global (K=V shared) layers (Gemma-4 only).
-        - **Dashed horizontal lines** = theoretical ideals (r=1, SSR=0, α=1)
+        - **IQR band** — 25%–75% quantile across attention heads per layer.
+          Narrow band → heads are consistent → model is well-organized.
+        - **Dotted vertical lines** — global (K=V shared) layers (Gemma-4 only).
+        - **Dashed horizontal lines** — theoretical ideals (r=1, SSR=0, α=1)
           or random baselines (cosU: 1/√d_head · cosV: 1/√d_model).
-        - **Super-orthogonality** (Law 4): cosU(Q–V) and cosU(K–V) sit *below*
-          the random baseline — pretraining actively pushes V away from Q/K.
+        - **Super-orthogonality** (Law 4) — cosU(Q–V) and cosU(K–V) sit *below*
+          the random baseline; pretraining actively pushes V away from Q/K.
         """)
 
         # ── Wiring ────────────────────────────────────────────────────────────
+
         single_plotly_btn.click(
             fn=gen_single_plotly,
             inputs=[single_model, modality_sel, start_l, end_l, show_band_chk],
-            outputs=[single_plotly_fig, single_plotly_status],
+            outputs=[single_plotly_fig, single_status],
         )
         single_export_btn.click(
             fn=gen_single_export,
             inputs=[single_model, modality_sel, start_l, end_l, show_band_chk],
-            outputs=[single_export_status, single_preview,
+            outputs=[single_status, single_preview,
                      dl_s_png, dl_s_pdf, dl_s_svg, dl_s_zip],
         )
         cmp_plotly_btn.click(
             fn=gen_compare_plotly,
             inputs=[model_a, model_b, modality_sel,
                     start_l, end_l, show_band_chk, show_delta_chk],
-            outputs=[cmp_plotly_fig, cmp_plotly_status],
+            outputs=[cmp_plotly_fig, cmp_status],
         )
         cmp_export_btn.click(
             fn=gen_compare_export,
             inputs=[model_a, model_b, modality_sel,
                     start_l, end_l, show_band_chk, show_delta_chk],
-            outputs=[cmp_export_status, cmp_preview,
+            outputs=[cmp_status, cmp_preview,
                      dl_c_png, dl_c_pdf, dl_c_svg, dl_c_zip],
         )
