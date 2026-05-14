@@ -204,8 +204,9 @@ def plot_single_model(
     ax = axes[1, 2]
     draw(ax, "cond_Q", C["Q"], "κ(Q)")
     draw(ax, "cond_K", C["K"], "κ(K)")
-    _finalize_ax(ax, "Law 3 — Condition Number κ",
-                 "Condition number κ")
+    ax.set_yscale("log")
+    _finalize_ax(ax, "Law 3 — Condition Number κ  (log scale)",
+                 "Condition number κ  (log)")
 
     # ── Row 2: Law 4 ─────────────────────────────────────────────────────────
     # Share y-axis across this row
@@ -374,7 +375,8 @@ def plot_compare_models(
                f"{name_a} κ(K)", "-", show_band, None)
     _draw_line(ax, lay_b, med_b, q25_b, q75_b, C["K"],
                f"{name_b} κ(K)", "--", show_band, None)
-    _finalize_ax(ax, "Law 3 — Condition Number κ", "Condition number κ")
+    ax.set_yscale("log")
+    _finalize_ax(ax, "Law 3 — Condition Number κ  (log scale)", "Condition number κ  (log)")
 
     # ── Row 2: Law 4 ─────────────────────────────────────────────────────────
     u_cols = [("cosU_QK", C["QK"], "Q–K"),

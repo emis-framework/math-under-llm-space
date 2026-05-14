@@ -247,6 +247,9 @@ def plotly_single(
                          title_font=dict(size=11))
         fig.update_xaxes(title_text="Layer index", row=row_idx, col=1,
                          title_font=dict(size=11))
+        # ── log scale for condition number panel (row 6) ─────────────────────
+        if col == "cond_dual":
+            fig.update_yaxes(type="log", row=row_idx, col=1)
 
     # ── shared Y for cosU row (panels 6,7,8) ─────────────────────────────────
     _sync_yrange(fig, df, ["cosU_QK", "cosU_QV", "cosU_KV"],
@@ -411,6 +414,9 @@ def plotly_compare(
                          title_font=dict(size=11))
         fig.update_xaxes(title_text="Layer index", row=row_idx, col=1,
                          title_font=dict(size=11))
+        # ── log scale for condition number panel (row 6) ─────────────────────
+        if col == "cond_dual":
+            fig.update_yaxes(type="log", row=row_idx, col=1)
 
     _sync_yrange_compare(fig, df_a, df_b,
                          ["cosU_QK", "cosU_QV", "cosU_KV"], [7, 8, 9])
