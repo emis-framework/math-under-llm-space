@@ -473,13 +473,4 @@ def fig_to_png_bytes(fig: plt.Figure) -> bytes:
     return buf.read()
 
 
-def fig_to_plotly(fig_mpl: plt.Figure):
-    """
-    Convert matplotlib Figure to a Plotly figure via mpl_to_plotly.
-    Requires plotly installed.  Falls back gracefully.
-    """
-    try:
-        import plotly.tools as tls
-        return tls.mpl_to_plotly(fig_mpl)
-    except Exception:
-        return None
+# fig_to_plotly removed — use core/plotter_plotly.py for native Plotly figures.
