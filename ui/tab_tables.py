@@ -191,7 +191,7 @@ def build_tab_tables():
 
         | Table | Content | Law |
         |-------|---------|-----|
-        | 1 | Cross-model summary: Pearson r, SSR, Wang Score | 1 & 2 |
+        | 1 | Cross-model summary: Pearson r, SSR (Wang Score in Table 6) | 1 & 2 |
         | 2 | SSR layer-group trend (RL effect, user-defined groups) | 2 |
         | 3 | Output subspace cosU: Q–K, Q–V, K–V + random baseline | 4 |
         | 4 | Input subspace cosV: Q–K, Q–V, K–V + random baseline | 5 |
@@ -201,27 +201,40 @@ def build_tab_tables():
         > Run **Tab 2 (Analyze)** first to populate the database.
         """)
 
-        choices = _get_model_choices()
+        # ── Model selector with Refresh ───────────────────────────────────────
+        def _refresh_choices():
+            new_choices = _get_model_choices()
+            return (
+                gr.CheckboxGroup(choices=new_choices, value=new_choices),
+                gr.Dropdown(choices=new_choices),
+                gr.Dropdown(choices=new_choices),
+            )
+
+        init_choices = _get_model_choices()
 
         # ── Controls ──────────────────────────────────────────────────────────
         with gr.Row():
             with gr.Column(scale=3):
+                with gr.Row():
+                    gr.Markdown("**Models to include** (all tables use selected models)")
+                    refresh_btn = gr.Button("🔄 Refresh", scale=0, min_width=100)
                 model_selector = gr.CheckboxGroup(
-                    choices  = choices,
-                    value    = choices,   # default: all selected
-                    label    = "Models to include (all tables use selected models)",
+                    choices  = init_choices,
+                    value    = init_choices,
+                    label    = "",
+                    show_label=False,
                 )
             with gr.Column(scale=2):
                 gr.Markdown("**Table 2 — SSR Layer-Group Comparison**")
                 t2_model_a = gr.Dropdown(
-                    choices          = choices,
-                    value            = choices[0] if choices else None,
+                    choices          = init_choices,
+                    value            = init_choices[0] if init_choices else None,
                     allow_custom_value=True,
                     label            = "Model A (base)",
                 )
                 t2_model_b = gr.Dropdown(
-                    choices          = choices,
-                    value            = choices[1] if len(choices) > 1 else None,
+                    choices          = init_choices,
+                    value            = init_choices[1] if len(init_choices) > 1 else None,
                     allow_custom_value=True,
                     label            = "Model B (RL-tuned / comparison)",
                     info             = "Leave same as A for single-model view",
@@ -230,7 +243,7 @@ def build_tab_tables():
                     label       = "Layer groups (comma-separated lo-hi pairs)",
                     value       = "0-11, 12-23, 24-35, 36-47",
                     placeholder = "0-11, 12-23, 24-35, 36-47",
-                    info        = "Adjust for your model's depth, e.g. 0-7, 8-15, 16-23, 24-31 for 32-layer models",
+                    info        = "Adjust for model depth: 32-layer→0-7,8-15,16-23,24-31  60-layer→0-14,15-29,30-44,45-59",
                 )
 
         generate_btn = gr.Button("🚀 Generate All Tables", variant="primary")
@@ -316,4 +329,10 @@ def build_tab_tables():
                 dl_t1, dl_t2, dl_t3, dl_t4, dl_t5, dl_t6,
                 dl_latex, dl_md, dl_zip,
             ],
+        )
+
+        refresh_btn.click(
+            fn      = _refresh_choices,
+            inputs  = [],
+            outputs = [model_selector, t2_model_a, t2_model_b],
         )

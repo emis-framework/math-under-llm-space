@@ -138,7 +138,6 @@ def make_table1(
             "Mean Pearson":  _fmt(_mean(std["pearson_QK"]), 4),
             "Median SSR":    _fmt(_med(std["ssr_QK"]), 6),
             "Mean SSR":      _fmt(_mean(std["ssr_QK"]), 6),
-            "Wang Score":    _fmt(1 - _med(std["ssr_QK"]) if _med(std["ssr_QK"]) is not None else None, 6),
         })
     return pd.DataFrame(rows)
 
