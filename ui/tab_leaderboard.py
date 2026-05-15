@@ -1,7 +1,8 @@
 # ui/tab_leaderboard.py
 """
 Tab3: Wang's Five Laws Leaderboard
-- Ranked by wang_score (= 1 − median SSR_QK, standard layers only)
+- Ranked by wang_score (= 1 − pseudo-bulk median SSR_QK, standard layers only)
+- On Refresh: silently re-computes all model_summary rows (pseudo-bulk migration)
 - Filter by modality (default: language)
 - Filter by layer_type (default: standard)
 """
@@ -12,6 +13,7 @@ import numpy as np
 
 from db.schema import init_db
 from db.reader import get_leaderboard
+from db.writer import refresh_all_summaries
 
 
 def _format_leaderboard(df: pd.DataFrame) -> pd.DataFrame:
@@ -47,8 +49,12 @@ def load_leaderboard(
     layer_type: str,
 ) -> tuple[pd.DataFrame, str]:
     conn = init_db()
-    lt   = layer_type if layer_type != "all" else "standard"
-    mod  = modality
+
+    # ── Silently refresh all summaries (pseudo-bulk migration) ────────────
+    n_refreshed = refresh_all_summaries(conn)
+
+    lt  = layer_type if layer_type != "all" else "standard"
+    mod = modality
 
     df = get_leaderboard(conn, modality=mod, layer_type=lt, limit=100)
 
@@ -62,7 +68,8 @@ def load_leaderboard(
     formatted = _format_leaderboard(df)
     status = (
         f"✅ {len(formatted)} entries  "
-        f"| modality={mod}  layer_type={lt}"
+        f"| modality={mod}  layer_type={lt}  "
+        f"| summaries refreshed: {n_refreshed}"
     )
     return formatted, status
 
@@ -72,11 +79,12 @@ def build_tab_leaderboard():
         gr.Markdown(r"""
         ## Wang's Five Laws — Model Leaderboard
 
-        **Wang Score = 1 − median(SSR\_QK)**  Higher is better. Theoretical max = 1.  
+        **Wang Score = 1 − median(SSR\_QK)**  Higher is better. Theoretical max = 1.
         Computed from `standard` layers only (global/KV-shared layers excluded).
+        Metrics use **pseudo-bulk aggregation** (Nature Comms 2021) to avoid GQA pseudoreplication.
 
         > 王氏评分 = 1 − median(SSR_QK)，越高越好，理论极值=1。
-        > 仅基于 standard 层计算（排除 K=V 共享的全局层干扰）。
+        > 仅基于 standard 层计算。采用 pseudo-bulk 两步聚合避免 GQA 伪重复计数。
         """)
 
         with gr.Row():

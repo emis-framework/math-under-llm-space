@@ -32,6 +32,43 @@ def _mean(series) -> Optional[float]:
     return float(v.mean()) if len(v) > 0 else None
 
 
+def _pseudobulk(df: pd.DataFrame, col: str) -> np.ndarray:
+    """
+    Pseudo-bulk two-step aggregation (Nature Comms 2021).
+    Step 1: median across Q heads within each (layer, kv_head) group.
+    Step 2: median across kv_head groups per layer.
+    Returns 1-D array of per-layer medians.
+    For MHA models this equals a plain per-layer median.
+    """
+    if df.empty or col not in df.columns:
+        return np.array([])
+    layers = sorted(df["layer"].unique())
+    per_layer = []
+    for layer in layers:
+        ldf = df[df["layer"] == layer]
+        if "kv_head" in ldf.columns:
+            step1 = ldf.groupby("kv_head")[col].median().values
+        else:
+            step1 = ldf[col].dropna().values
+        step1 = np.array(step1, dtype=float)
+        step1 = step1[~np.isnan(step1)]
+        if len(step1) > 0:
+            per_layer.append(float(np.median(step1)))
+    return np.array(per_layer, dtype=float)
+
+
+def _pb_med(df: pd.DataFrame, col: str) -> Optional[float]:
+    """Pseudo-bulk median across layers."""
+    v = _pseudobulk(df, col)
+    return float(np.median(v)) if len(v) > 0 else None
+
+
+def _pb_mean(df: pd.DataFrame, col: str) -> Optional[float]:
+    """Pseudo-bulk mean across layers."""
+    v = _pseudobulk(df, col)
+    return float(np.mean(v)) if len(v) > 0 else None
+
+
 def _fmt(x, decimals=6) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return "—"
@@ -134,10 +171,10 @@ def make_table1(
             "Model":         _short(model_id),
             "Std Layers":    n_layers,
             "Global Layers": n_global if n_global > 0 else "—",
-            "Median Pearson":_fmt(_med(std["pearson_QK"]), 4),
-            "Mean Pearson":  _fmt(_mean(std["pearson_QK"]), 4),
-            "Median SSR":    _fmt(_med(std["ssr_QK"]), 6),
-            "Mean SSR":      _fmt(_mean(std["ssr_QK"]), 6),
+            "Median Pearson":_fmt(_pb_med(std, "pearson_QK"), 4),
+            "Mean Pearson":  _fmt(_pb_mean(std, "pearson_QK"), 4),
+            "Median SSR":    _fmt(_pb_med(std, "ssr_QK"), 6),
+            "Mean SSR":      _fmt(_pb_mean(std, "ssr_QK"), 6),
         })
     return pd.DataFrame(rows)
 
@@ -166,13 +203,13 @@ def make_table2(
     for lo, hi in group_bounds:
         label = f"{lo}–{hi}"
         grp_a = std_a[(std_a["layer"] >= lo) & (std_a["layer"] <= hi)]
-        ssr_a = _med(grp_a["ssr_QK"])
+        ssr_a = _pb_med(grp_a, "ssr_QK")
 
         row = {"Layer Group": label, f"{_short(name_a)} SSR": _fmt(ssr_a, 6)}
 
         if std_b is not None and name_b:
             grp_b = std_b[(std_b["layer"] >= lo) & (std_b["layer"] <= hi)]
-            ssr_b = _med(grp_b["ssr_QK"])
+            ssr_b = _pb_med(grp_b, "ssr_QK")
             row[f"{_short(name_b)} SSR"] = _fmt(ssr_b, 6)
             if ssr_a and ssr_b and ssr_a > 0:
                 improvement = (ssr_a - ssr_b) / ssr_a * 100
@@ -207,9 +244,9 @@ def make_table3(
             "Model":           _short(model_id),
             "d_h":             head_dim,
             "Random 1/√d_h":  _fmt(baseline, 4),
-            "cosU(Q,K)":      _fmt(_med(std["cosU_QK"]), 4),
-            "cosU(Q,V)":      _fmt(_med(std["cosU_QV"]), 4),
-            "cosU(K,V)":      _fmt(_med(std["cosU_KV"]), 4),
+            "cosU(Q,K)":      _fmt(_pb_med(std, "cosU_QK"), 4),
+            "cosU(Q,V)":      _fmt(_pb_med(std, "cosU_QV"), 4),
+            "cosU(K,V)":      _fmt(_pb_med(std, "cosU_KV"), 4),
         })
     return pd.DataFrame(rows)
 
@@ -237,9 +274,9 @@ def make_table4(
             "Model":           _short(model_id),
             "d_model":         d_model,
             "Random 1/√D":    _fmt(baseline, 4),
-            "cosV(Q,K)":      _fmt(_med(std["cosV_QK"]), 4),
-            "cosV(Q,V)":      _fmt(_med(std["cosV_QV"]), 4),
-            "cosV(K,V)":      _fmt(_med(std["cosV_KV"]), 4),
+            "cosV(Q,K)":      _fmt(_pb_med(std, "cosV_QK"), 4),
+            "cosV(Q,V)":      _fmt(_pb_med(std, "cosV_QV"), 4),
+            "cosV(K,V)":      _fmt(_pb_med(std, "cosV_KV"), 4),
         })
     return pd.DataFrame(rows)
 
@@ -267,12 +304,12 @@ def make_table5(
         deep = std[std["layer"] > std["layer"].min()]
         rows.append({
             "Model":            _short(model_id),
-            "Median κ(Q) all":  _fmt(_med(std["cond_Q"]), 1),
-            "Median κ(K) all":  _fmt(_med(std["cond_K"]), 1),
-            "κ(Q) Layer 0":     _fmt(_med(l0["cond_Q"]), 1),
-            "κ(K) Layer 0":     _fmt(_med(l0["cond_K"]), 1),
-            "Median κ(Q) deep": _fmt(_med(deep["cond_Q"]), 1),
-            "Median κ(K) deep": _fmt(_med(deep["cond_K"]), 1),
+            "Median κ(Q) all":  _fmt(_pb_med(std, "cond_Q"), 1),
+            "Median κ(K) all":  _fmt(_pb_med(std, "cond_K"), 1),
+            "κ(Q) Layer 0":     _fmt(_pb_med(l0,  "cond_Q"), 1),
+            "κ(K) Layer 0":     _fmt(_pb_med(l0,  "cond_K"), 1),
+            "Median κ(Q) deep": _fmt(_pb_med(deep, "cond_Q"), 1),
+            "Median κ(K) deep": _fmt(_pb_med(deep, "cond_K"), 1),
         })
     return pd.DataFrame(rows)
 
@@ -293,9 +330,9 @@ def make_table6(
         std = _standard_only(df)
         if std.empty:
             continue
-        med_ssr     = _med(std["ssr_QK"])
+        med_ssr     = _pb_med(std, "ssr_QK")
         wang_score  = 1 - med_ssr if med_ssr is not None else None
-        med_pearson = _med(std["pearson_QK"])
+        med_pearson = _pb_med(std, "pearson_QK")
         rows.append({
             "Model":          _short(model_id),
             "Std Layers":     std["layer"].nunique(),

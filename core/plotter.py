@@ -73,19 +73,33 @@ BAND_COLORS = {
 
 def _aggregate_by_layer(df: pd.DataFrame, col: str):
     """
-    Group by layer, return (layers, median, q25, q75).
-    Excludes kv_shared=True rows for KV metrics to avoid theoretical-value bias.
+    Pseudo-bulk two-step aggregation per layer (Nature Comms 2021).
+    Step 1: median across Q heads within each (layer, kv_head) group.
+    Step 2: median / q25 / q75 across kv_head groups per layer.
+    Avoids pseudoreplication bias in GQA models (e.g. 4Q:1K).
+    Excludes kv_shared rows for KV metrics (theoretical-value bias).
     """
     kv_cols = {"ssr_KV", "pearson_KV", "cosU_KV", "cosV_KV", "alpha_KV"}
     if col in kv_cols:
         df = df[df["kv_shared"] == 0] if "kv_shared" in df.columns else df
 
-    grp = df.groupby("layer")[col]
     layers = np.array(sorted(df["layer"].unique()))
-    med    = grp.median().reindex(layers).values
-    q25    = grp.quantile(0.25).reindex(layers).values
-    q75    = grp.quantile(0.75).reindex(layers).values
-    return layers, med, q25, q75
+    med_vals, q25_vals, q75_vals = [], [], []
+
+    for layer in layers:
+        ldf = df[df["layer"] == layer]
+        # Step 1: median within each kv_head group
+        if "kv_head" in ldf.columns:
+            step1 = ldf.groupby("kv_head")[col].median().values
+        else:
+            step1 = ldf[col].dropna().values
+        step1 = step1[~np.isnan(step1)] if len(step1) > 0 else step1
+        # Step 2: statistics across kv_head medians
+        med_vals.append(float(np.median(step1)) if len(step1) > 0 else np.nan)
+        q25_vals.append(float(np.percentile(step1, 25)) if len(step1) > 0 else np.nan)
+        q75_vals.append(float(np.percentile(step1, 75)) if len(step1) > 0 else np.nan)
+
+    return layers, np.array(med_vals), np.array(q25_vals), np.array(q75_vals)
 
 
 def _global_layers(df: pd.DataFrame):

@@ -63,15 +63,37 @@ TOTAL_HEIGHT   = SUBPLOT_HEIGHT * len(PANELS) + 120   # +header
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _agg(df: pd.DataFrame, col: str):
-    """Per-layer median + IQR. Excludes kv_shared rows for KV metrics."""
+    """
+    Pseudo-bulk two-step aggregation per layer (Nature Comms 2021).
+    Step 1: median across Q heads within each (layer, kv_head) group.
+    Step 2: median / q25 / q75 across kv_head groups per layer.
+    Avoids pseudoreplication bias in GQA models (e.g. 4Q:1K).
+    Excludes kv_shared rows for KV metrics (theoretical-value bias).
+    """
     kv_cols = {"ssr_KV", "pearson_KV", "cosU_KV", "cosV_KV", "alpha_KV"}
-    d = df[df["kv_shared"] == 0] if col in kv_cols and "kv_shared" in df.columns else df
-    grp    = d.groupby("layer")[col]
-    layers = np.array(sorted(d["layer"].unique()), dtype=int)
-    med    = grp.median().reindex(layers).values.astype(float)
-    q25    = grp.quantile(0.25).reindex(layers).values.astype(float)
-    q75    = grp.quantile(0.75).reindex(layers).values.astype(float)
-    return layers, med, q25, q75
+    if col in kv_cols and "kv_shared" in df.columns:
+        df = df[df["kv_shared"] == 0]
+
+    layers = np.array(sorted(df["layer"].unique()), dtype=int)
+    med_vals, q25_vals, q75_vals = [], [], []
+
+    for layer in layers:
+        ldf = df[df["layer"] == layer]
+        # Step 1: median within each kv_head group
+        if "kv_head" in ldf.columns:
+            step1 = ldf.groupby("kv_head")[col].median().values
+        else:
+            step1 = ldf[col].dropna().values
+        step1 = step1[~np.isnan(step1.astype(float))] if len(step1) > 0 else step1
+        # Step 2: statistics across kv_head medians
+        med_vals.append(float(np.median(step1)) if len(step1) > 0 else np.nan)
+        q25_vals.append(float(np.percentile(step1, 25)) if len(step1) > 0 else np.nan)
+        q75_vals.append(float(np.percentile(step1, 75)) if len(step1) > 0 else np.nan)
+
+    return (layers,
+            np.array(med_vals, dtype=float),
+            np.array(q25_vals, dtype=float),
+            np.array(q75_vals, dtype=float))
 
 
 def _global_layers(df: pd.DataFrame) -> list[int]:

@@ -2,7 +2,7 @@
 """
 数据库写入模块
 - 写入分析结果到 layer_head_metrics
-- 计算并写入 model_summary
+- 计算并写入 model_summary（pseudo-bulk 两步聚合，避免 GQA 伪重复）
 - 支持断点续传（以 prefix+layer 为粒度）
 - 写入权限验证
 """
@@ -10,6 +10,7 @@
 import os
 import sqlite3
 import numpy as np
+from collections import defaultdict
 from datetime import datetime
 from db.schema import get_connection, init_db
 
@@ -19,21 +20,10 @@ from db.schema import get_connection, init_db
 # ─────────────────────────────────────────────
 
 def infer_layer_type(kv_shared: bool) -> str:
-    """
-    从结构特征推断层类型
-    kv_shared=True  → 'global'  （K=V共享，如 Gemma 全局层）
-    kv_shared=False → 'standard'
-    """
     return "global" if kv_shared else "standard"
 
 
 def infer_modality(prefix: str) -> str:
-    """
-    从组件前缀推断模态
-    纯关键词匹配，不 hard coding 模型名
-    未匹配到任何关键词 → 默认 'language'
-    （覆盖纯语言模型，如 "model." 前缀的 LLaMA/Qwen）
-    """
     p = prefix.lower()
     if "vision" in p or "visual" in p or "image" in p:
         return "vision"
@@ -47,15 +37,6 @@ def infer_modality(prefix: str) -> str:
 # ─────────────────────────────────────────────
 
 def check_write_permission(admin_token: str) -> bool:
-    """
-    验证管理员写入权限。
-    WRITE_TOKEN 存储在 HF Space Secrets（加密，不进入 git repo）。
-    运行时由 HF 注入为环境变量，只在服务端比对，不返回给前端。
-
-    返回：
-      True  = 有写入权限
-      False = 只读模式（分析可以跑，结果不写库）
-    """
     server_token = os.environ.get("WRITE_TOKEN", "")
     if not server_token:
         return False
@@ -71,7 +52,6 @@ def get_analyzed_layers(
     model_id: str,
     prefix:   str,
 ) -> set:
-    """返回已完成分析的层号集合"""
     cur = conn.cursor()
     cur.execute(
         """SELECT DISTINCT layer FROM layer_head_metrics
@@ -88,7 +68,6 @@ def is_layer_complete(
     layer:            int,
     expected_records: int,
 ) -> bool:
-    """检查某层是否已完整写入"""
     cur = conn.cursor()
     cur.execute(
         """SELECT COUNT(*) FROM layer_head_metrics
@@ -227,11 +206,66 @@ def write_layer_records(
 
 
 # ─────────────────────────────────────────────
+# Pseudo-bulk 聚合核心函数
+# ─────────────────────────────────────────────
+
+def _pseudobulk(rows, col_name: str) -> np.ndarray:
+    """
+    Pseudo-bulk two-step aggregation (Nature Comms 2021).
+    Avoids GQA pseudoreplication (e.g. 4Q:1K → 4 correlated records per KV head).
+
+    Step 1: median within each (layer, kv_head) group
+            → one value per KV-head per layer
+    Step 2: return flat array of Step-1 values
+            → caller computes final median / mean / quantile
+
+    Works with both sqlite3.Row objects and plain dicts.
+    """
+    groups: dict[tuple, list] = defaultdict(list)
+    for r in rows:
+        try:
+            v       = r["ssr_QK"] if col_name == "ssr_QK" else r[col_name]
+            layer   = int(r["layer"])
+            kv_head = int(r["kv_head"]) if r["kv_head"] is not None else 0
+        except (KeyError, TypeError, IndexError):
+            continue
+        if v is None:
+            continue
+        groups[(layer, kv_head)].append(float(v))
+
+    if not groups:
+        return np.array([])
+
+    # Step 1: median within each (layer, kv_head) group
+    return np.array([float(np.median(vals)) for vals in groups.values()])
+
+
+def _pseudobulk_col(rows, col_name: str) -> np.ndarray:
+    """Generic version of _pseudobulk for any column name."""
+    groups: dict[tuple, list] = defaultdict(list)
+    for r in rows:
+        try:
+            v       = r[col_name]
+            layer   = int(r["layer"])
+            kv_head = int(r["kv_head"]) if r["kv_head"] is not None else 0
+        except (KeyError, TypeError, IndexError):
+            continue
+        if v is None:
+            continue
+        groups[(layer, kv_head)].append(float(v))
+
+    if not groups:
+        return np.array([])
+
+    return np.array([float(np.median(vals)) for vals in groups.values()])
+
+
+# ─────────────────────────────────────────────
 # 计算并写入 model_summary
 # ─────────────────────────────────────────────
 
 def _calc_summary_row(
-    rows:       list,
+    rows,
     model_id:   str,
     prefix:     str,
     layer_type: str,
@@ -239,14 +273,13 @@ def _calc_summary_row(
     if not rows:
         return None
 
-    def col(name):
-        vals = [r[name] for r in rows if r[name] is not None]
-        return np.array(vals, dtype=float) if vals else np.array([])
+    def pb(col):
+        return _pseudobulk_col(rows, col)
 
     def med(arr): return float(np.median(arr)) if len(arr) > 0 else None
     def avg(arr): return float(np.mean(arr))   if len(arr) > 0 else None
 
-    ssr_qk     = col("ssr_QK")
+    ssr_qk     = pb("ssr_QK")
     wang_score = float(1 - np.median(ssr_qk)) if len(ssr_qk) > 0 else None
     n_layers   = len(set(r["layer"] for r in rows))
     n_records  = len(rows)
@@ -255,18 +288,18 @@ def _calc_summary_row(
         "model_id":          model_id,
         "prefix":            prefix,
         "layer_type":        layer_type,
-        "median_pearson_QK": med(col("pearson_QK")),
-        "mean_pearson_QK":   avg(col("pearson_QK")),
+        "median_pearson_QK": med(pb("pearson_QK")),
+        "mean_pearson_QK":   avg(pb("pearson_QK")),
         "median_ssr_QK":     med(ssr_qk),
         "mean_ssr_QK":       avg(ssr_qk),
-        "median_ssr_QV":     med(col("ssr_QV")),
-        "mean_ssr_QV":       avg(col("ssr_QV")),
-        "median_cond_Q":     med(col("cond_Q")),
-        "mean_cond_Q":       avg(col("cond_Q")),
-        "median_cosU_QK":    med(col("cosU_QK")),
-        "median_cosU_QV":    med(col("cosU_QV")),
-        "median_cosV_QK":    med(col("cosV_QK")),
-        "median_cosV_QV":    med(col("cosV_QV")),
+        "median_ssr_QV":     med(pb("ssr_QV")),
+        "mean_ssr_QV":       avg(pb("ssr_QV")),
+        "median_cond_Q":     med(pb("cond_Q")),
+        "mean_cond_Q":       avg(pb("cond_Q")),
+        "median_cosU_QK":    med(pb("cosU_QK")),
+        "median_cosU_QV":    med(pb("cosU_QV")),
+        "median_cosV_QK":    med(pb("cosV_QK")),
+        "median_cosV_QV":    med(pb("cosV_QV")),
         "wang_score":        wang_score,
         "n_layers":          n_layers,
         "n_records":         n_records,
@@ -280,21 +313,20 @@ def update_model_summary(
     prefix:   str,
 ):
     """
-    重新计算并写入 model_summary（all / standard / global 三行）
-    wang_score 统一用 standard 层计算
+    重新计算并写入 model_summary（all / standard / global 三行）。
+    wang_score 统一用 standard 层 pseudo-bulk median(SSR_QK) 计算。
     """
     cur = conn.cursor()
+    cur.row_factory = sqlite3.Row
 
-    # 预取 standard 层的 ssr_QK（wang_score 统一用这个）
+    # ── Wang Score: standard 层 pseudo-bulk ──────────────────────────────
     cur.execute(
-        """SELECT ssr_QK FROM layer_head_metrics
-           WHERE model_id = ? AND prefix = ? AND layer_type = 'standard'""",
+        """SELECT layer, kv_head, ssr_QK FROM layer_head_metrics
+           WHERE model_id = ? AND prefix = ? AND layer_type = 'standard'
+             AND kv_shared = 0""",
         (model_id, prefix)
     )
-    std_ssr_rows = cur.fetchall()
-    std_ssr = np.array(
-        [r[0] for r in std_ssr_rows if r[0] is not None], dtype=float
-    )
+    std_ssr       = _pseudobulk_col(cur.fetchall(), "ssr_QK")
     std_wang_score = float(1 - np.median(std_ssr)) if len(std_ssr) > 0 else None
 
     for layer_type in ["all", "standard", "global"]:
@@ -315,8 +347,7 @@ def update_model_summary(
         if summary is None:
             continue
 
-        # wang_score 统一用 standard 层
-        summary["wang_score"] = std_wang_score
+        summary["wang_score"] = std_wang_score  # always from standard pseudo-bulk
 
         conn.execute(
             """INSERT OR REPLACE INTO model_summary(
@@ -342,3 +373,23 @@ def update_model_summary(
         )
 
     conn.commit()
+
+
+# ─────────────────────────────────────────────
+# 批量刷新所有模型的 model_summary
+# ─────────────────────────────────────────────
+
+def refresh_all_summaries(conn: sqlite3.Connection) -> int:
+    """
+    Re-compute model_summary for every (model_id, prefix) in the DB.
+    Called by Tab 3 Refresh button to migrate historical data to pseudo-bulk.
+    Returns number of (model_id, prefix) pairs refreshed.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT DISTINCT model_id, prefix FROM layer_head_metrics"
+    )
+    pairs = cur.fetchall()
+    for model_id, prefix in pairs:
+        update_model_summary(conn, model_id, prefix)
+    return len(pairs)
