@@ -5,6 +5,9 @@ Tab2: Analyze a single model
 - Filter layers by start_layer / end_layer (raw index)
 - Compute all Wang's Five Laws metrics per head
 - Write results to SQLite if admin token is valid (read-only for reviewers)
+
+Fix: upsert_model / upsert_component are now written AFTER shard headers load
+     successfully, preventing dirty DB entries from mistyped model names.
 """
 
 import gradio as gr
@@ -114,17 +117,17 @@ def run_analysis(
 
     all_records: list[dict] = []
 
-    # ── DB connection (needed for resume check even in read-only) ──
+    # ── DB connection ─────────────────────────────────────────────────────────
     conn = init_db()
 
-    # ── Quantization check ────────────────────────────────────────
+    # ── Quantization check ────────────────────────────────────────────────────
     progress(0.02, desc="Checking quantization...")
     blocked, qmsg = check_quantization(model_id, token)
     log.append(f"[Quantization Check]\n{qmsg}\n{'─'*80}\n")
     if blocked:
         return "".join(log), None
 
-    # ── config.json ───────────────────────────────────────────────
+    # ── config.json ───────────────────────────────────────────────────────────
     progress(0.05, desc="Reading config...")
     config_params = {}
     try:
@@ -143,12 +146,9 @@ def run_analysis(
     except Exception:
         log.append("⚠️  Could not read config.json\n")
 
-    # ── Write model metadata (admin only) ────────────────────────
-    if can_write:
-        model_type = config_params.get("model_type", "unknown")
-        upsert_model(conn, model_id, model_type=model_type)
-
-    # ── Load all shard headers ────────────────────────────────────
+    # ── Load all shard headers ────────────────────────────────────────────────
+    # NOTE: upsert_model is intentionally called AFTER this succeeds.
+    # This prevents dirty DB entries when a model name is mistyped (404 here).
     progress(0.08, desc="Loading shard headers...")
     try:
         all_headers = load_all_shard_headers(model_id, token)
@@ -162,14 +162,21 @@ def run_analysis(
         f"Total keys: {sum(len(h) for h,_ in all_headers.values())}\n"
     )
 
-    # ── Scan layer structure ──────────────────────────────────────
+    # ── Scan layer structure ──────────────────────────────────────────────────
     progress(0.12, desc="Scanning layer structure...")
     profiles = scan_model_structure(all_headers, config_params)
 
     if not profiles:
         return "".join(log) + "⚠️ No Q/K/V layers found.\n", None
 
-    # ── Write component metadata (admin only) ────────────────────
+    # ── Write model metadata (admin only) — AFTER successful header load ──────
+    # Model name is now confirmed valid (HF returned real shard headers).
+    if can_write:
+        model_type = config_params.get("model_type", "unknown")
+        upsert_model(conn, model_id, model_type=model_type)
+        log.append(f"💾 Model registered in DB: {model_id}\n")
+
+    # ── Write component metadata (admin only) ─────────────────────────────────
     if can_write:
         by_prefix: dict[str, list] = {}
         for (pfx, idx), prof in profiles.items():
@@ -194,7 +201,7 @@ def run_analysis(
                 d_model       = d_models[0] if d_models else 0,
             )
 
-    # ── Filter by layer range ─────────────────────────────────────
+    # ── Filter by layer range ─────────────────────────────────────────────────
     filtered = {
         (pfx, idx): prof
         for (pfx, idx), prof in profiles.items()
@@ -215,12 +222,12 @@ def run_analysis(
             f"Available layer indices:\n{info}\n", None
         )
 
-    # ── Resume check (always query DB, write only if can_write) ──
+    # ── Resume check ──────────────────────────────────────────────────────────
     done_layers: dict[str, set] = {}
     for pfx in set(pfx for pfx, _ in filtered):
         done_layers[pfx] = get_analyzed_layers(conn, model_id, pfx)
 
-    # ── Print analysis plan ───────────────────────────────────────
+    # ── Print analysis plan ───────────────────────────────────────────────────
     by_pfx2: dict[str, list] = {}
     for (pfx, idx) in filtered:
         by_pfx2.setdefault(pfx, []).append(idx)
@@ -248,13 +255,13 @@ def run_analysis(
             f"⚡ Resume: skipping {skipped_total} already-analyzed layers.\n"
         )
 
-    # ── Layer-by-layer analysis ───────────────────────────────────
+    # ── Layer-by-layer analysis ───────────────────────────────────────────────
     sorted_items = sorted(filtered.items(), key=lambda x: (x[0][0], x[0][1]))
     total = len(sorted_items)
 
     for i, ((pfx, idx), prof) in enumerate(sorted_items):
 
-        # Resume skip (only in write mode — reviewers always re-compute)
+        # Resume skip (only in write mode)
         if can_write and idx in done_layers.get(pfx, set()):
             continue
 
@@ -263,7 +270,7 @@ def run_analysis(
             desc=f"{pfx.split('.')[-2] if '.' in pfx else pfx} L{idx}..."
         )
 
-        # ── Load Q / K / V ────────────────────────────────────────
+        # ── Load Q / K / V ────────────────────────────────────────────────────
         try:
             q_url = get_file_url(model_id, prof.q.shard)
             k_url = get_file_url(model_id, prof.k.shard)
@@ -295,13 +302,13 @@ def run_analysis(
             log.append(f"[{pfx}] Layer {idx}: ⚠️ Tensor is None\n")
             continue
 
-        # ── Compute Five Laws ─────────────────────────────────────
+        # ── Compute Five Laws ─────────────────────────────────────────────────
         try:
             records, layer_log = analyze_layer(W_q, W_k, W_v, prof)
             all_records.extend(records)
             log.append(layer_log)
 
-            # ── Write to DB (admin only) ──────────────────────────
+            # ── Write to DB (admin only) ──────────────────────────────────────
             if can_write and records:
                 write_layer_records(conn, model_id, records)
                 update_model_summary(conn, model_id, pfx)
@@ -320,7 +327,7 @@ def run_analysis(
         finally:
             del W_q, W_k, W_v
 
-    # ── Update elapsed time (admin only) ─────────────────────────
+    # ── Update elapsed time (admin only) ─────────────────────────────────────
     if can_write:
         elapsed = (datetime.utcnow() - t_start).total_seconds()
         conn.execute(
@@ -329,7 +336,7 @@ def run_analysis(
         )
         conn.commit()
 
-    # ── Summary ───────────────────────────────────────────────────
+    # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = (datetime.utcnow() - t_start).total_seconds()
 
     if not all_records:
@@ -437,7 +444,7 @@ def build_tab_analyze():
                 token_input,
                 start_input,
                 end_input,
-                admin_token_input,   # ← 新增
+                admin_token_input,
             ],
             outputs=[analyze_log, analyze_table]
         )

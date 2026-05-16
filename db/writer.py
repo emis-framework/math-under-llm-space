@@ -5,6 +5,7 @@
 - 计算并写入 model_summary（pseudo-bulk 两步聚合，避免 GQA 伪重复）
 - 支持断点续传（以 prefix+layer 为粒度）
 - 写入权限验证
+- 级联删除模型
 """
 
 import os
@@ -393,3 +394,55 @@ def refresh_all_summaries(conn: sqlite3.Connection) -> int:
     for model_id, prefix in pairs:
         update_model_summary(conn, model_id, prefix)
     return len(pairs)
+
+
+# ─────────────────────────────────────────────
+# 删除模型（级联清除所有相关数据）
+# ─────────────────────────────────────────────
+
+def delete_model(
+    conn:        sqlite3.Connection,
+    model_id:    str,
+    admin_token: str,
+) -> tuple[bool, str]:
+    """
+    级联删除一个模型的所有数据。
+    删除顺序：layer_head_metrics → model_summary → components → models
+    需要 WRITE_TOKEN 验证。
+    返回 (success, message)
+    """
+    if not check_write_permission(admin_token):
+        return False, "❌ Permission denied: invalid or missing Admin Write Token."
+
+    model_id = model_id.strip()
+    if not model_id:
+        return False, "❌ Model ID is empty."
+
+    cur = conn.cursor()
+
+    # 先确认模型是否存在
+    cur.execute("SELECT model_id FROM models WHERE model_id = ?", (model_id,))
+    if cur.fetchone() is None:
+        return False, f"❌ Model not found in DB: '{model_id}'"
+
+    # 统计各表将被删除的行数（用于日志）
+    stats = {}
+    for table in ["layer_head_metrics", "model_summary", "components"]:
+        cur.execute(f"SELECT COUNT(*) FROM {table} WHERE model_id = ?", (model_id,))
+        stats[table] = cur.fetchone()[0]
+
+    # 级联删除（子表先删，最后删 models）
+    conn.execute("DELETE FROM layer_head_metrics WHERE model_id = ?", (model_id,))
+    conn.execute("DELETE FROM model_summary      WHERE model_id = ?", (model_id,))
+    conn.execute("DELETE FROM components         WHERE model_id = ?", (model_id,))
+    conn.execute("DELETE FROM models             WHERE model_id = ?", (model_id,))
+    conn.commit()
+
+    msg = (
+        f"✅ Deleted: '{model_id}'\n"
+        f"   layer_head_metrics : {stats['layer_head_metrics']} rows\n"
+        f"   model_summary      : {stats['model_summary']} rows\n"
+        f"   components         : {stats['components']} rows\n"
+        f"   models             : 1 row"
+    )
+    return True, msg

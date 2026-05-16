@@ -5,6 +5,7 @@ Tab4: Database Browser
 - Model detail (Plan B: raw components rows, expandable)
 - Per-head raw data query (modality + layer_type as two independent filters)
 - DB stats
+- Delete model (admin only, cascading)
 """
 
 import gradio as gr
@@ -18,6 +19,7 @@ from db.reader import (
     get_layer_metrics,
     get_resume_status,
 )
+from db.writer import delete_model
 
 
 def load_db_stats() -> str:
@@ -35,11 +37,6 @@ def load_db_stats() -> str:
 
 
 def load_model_list() -> pd.DataFrame:
-    """
-    方案A：按 modality 聚合层数
-    language_layers 含 standard + global（同一prefix下全部层）
-    vision/audio 为 0 时显示 0
-    """
     conn = init_db()
     df   = get_analyzed_models(conn)
     if df.empty:
@@ -47,7 +44,6 @@ def load_model_list() -> pd.DataFrame:
             "model_id", "model_type", "analyzed_at", "analyze_sec",
             "n_components", "language_layers", "vision_layers", "audio_layers"
         ])
-    # vision/audio 为 0 时替换为空字符串，更美观
     for col in ["vision_layers", "audio_layers"]:
         df[col] = df[col].apply(lambda x: "" if x == 0 else x)
     return df
@@ -56,25 +52,15 @@ def load_model_list() -> pd.DataFrame:
 def load_model_detail(
     model_id: str
 ) -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    """
-    返回：
-    1. 方案B：原始 components 行（prefix/modality/n_layers/head_dim等）
-    2. model_summary 汇总统计
-    3. 断点续传状态文本
-    """
     if not model_id.strip():
         return pd.DataFrame(), pd.DataFrame(), "Please enter a model ID."
 
     conn = init_db()
     mid  = model_id.strip()
 
-    # 方案B：原始 components
     comp_df    = get_model_components(conn, mid)
-
-    # 汇总统计
     summary_df = get_model_summary(conn, mid)
 
-    # 断点续传状态
     status_lines = [f"Resume Status: {mid}\n{'─'*50}\n"]
     if not comp_df.empty:
         for pfx in comp_df["prefix"].tolist():
@@ -97,10 +83,6 @@ def load_layer_data(
     start_layer:int,
     end_layer:  int,
 ) -> tuple[pd.DataFrame, str]:
-    """
-    逐头原始数据查询
-    modality 和 layer_type 两个维度独立过滤
-    """
     if not model_id.strip():
         return pd.DataFrame(), "Please enter a model ID."
 
@@ -131,6 +113,26 @@ def load_layer_data(
     return df, status
 
 
+def run_delete_model(
+    model_id:    str,
+    admin_token: str,
+) -> tuple[str, pd.DataFrame]:
+    """
+    级联删除指定模型的所有数据。
+    需要 Admin Write Token 验证。
+    返回 (状态文本, 刷新后的模型列表)
+    """
+    if not model_id.strip():
+        return "❌ Please enter a model ID to delete.", load_model_list()
+
+    conn = init_db()
+    success, msg = delete_model(conn, model_id.strip(), admin_token)
+
+    # 无论成功失败都刷新模型列表
+    updated_list = load_model_list()
+    return msg, updated_list
+
+
 # ─────────────────────────────────────────────
 # Tab4 UI
 # ─────────────────────────────────────────────
@@ -143,7 +145,7 @@ def build_tab_database():
             "> 查看已分析模型、逐头原始数据及断点续传状态。"
         )
 
-        # ── DB Stats ────────────────────────────────────────
+        # ── DB Stats ────────────────────────────────────────────────────────
         with gr.Row():
             stats_text = gr.Textbox(
                 label="Database Statistics",
@@ -159,7 +161,7 @@ def build_tab_database():
 
         gr.Markdown("---")
 
-        # ── Model List（方案A）──────────────────────────────
+        # ── Model List ───────────────────────────────────────────────────────
         gr.Markdown(
             "### Analyzed Models\n"
             "Layers are split by modality. "
@@ -181,7 +183,44 @@ def build_tab_database():
 
         gr.Markdown("---")
 
-        # ── Model Detail（方案B展开）────────────────────────
+        # ── Delete Model ─────────────────────────────────────────────────────
+        gr.Markdown(
+            "### 🗑️ Delete Model\n"
+            "Permanently remove a model and **all** its associated data "
+            "(layer_head_metrics, model_summary, components, models).\n"
+            "Requires Admin Write Token. This action **cannot be undone**.\n\n"
+            "> 永久删除模型及其所有关联数据，需要 Admin Write Token，操作不可逆。"
+        )
+        with gr.Row():
+            delete_model_id = gr.Textbox(
+                label="Model ID to delete",
+                placeholder="meta-llama/Meta-Llama-3-70B-intruct",
+                scale=3,
+            )
+            delete_token = gr.Textbox(
+                label="Admin Write Token",
+                type="password",
+                scale=2,
+            )
+            delete_btn = gr.Button(
+                "🗑️ Delete", variant="stop", scale=1
+            )
+
+        delete_status = gr.Textbox(
+            label="Delete Status",
+            lines=6,
+            interactive=False,
+        )
+
+        delete_btn.click(
+            fn=run_delete_model,
+            inputs=[delete_model_id, delete_token],
+            outputs=[delete_status, models_table],   # 删除后自动刷新模型列表
+        )
+
+        gr.Markdown("---")
+
+        # ── Model Detail ─────────────────────────────────────────────────────
         gr.Markdown(
             "### Model Detail & Resume Status\n"
             "Expand raw component rows and check which layers are done.\n\n"
@@ -202,7 +241,6 @@ def build_tab_database():
             lines=8,
             interactive=False,
         )
-        # 方案B：原始 components 行
         components_table = gr.Dataframe(
             label="Components (raw) — prefix / modality / n_layers / head_dim",
             headers=[
@@ -225,7 +263,7 @@ def build_tab_database():
 
         gr.Markdown("---")
 
-        # ── Raw Data Query ──────────────────────────────────
+        # ── Raw Data Query ───────────────────────────────────────────────────
         gr.Markdown(
             "### Per-head Raw Data Query\n"
             "`Modality` and `Layer Type` are two independent filter dimensions.\n\n"
