@@ -1,9 +1,9 @@
 # ui/tab_inspect.py
 """
-Tab1：模型结构探测
-- 读取所有 shard header
-- 展示原始 key 结构
-- 自动构建 LayerProfile 并展示推断结果
+Tab1: Model Structure Inspection
+- Read all shard headers
+- Display raw key structure
+- Auto-build LayerProfile and display inferred results
 """
 
 import gradio as gr
@@ -23,35 +23,36 @@ from core.layer_profile import (
 )
 
 SIDEBAR_MD = """
-### ✅ 推荐模型
+### ✅ Recommended Models
 google/gemma-4-e2b  
 google/gemma-4-e4b-it  
 google/gemma-4-31b-it  
 Qwen/Qwen2.5-14B-Instruct  
 deepseek-ai/DeepSeek-R1-Distill-Qwen-14B  
-meta-llama/Meta-Llama-3-8B  
+meta-llama/Meta-Llama-3-8B （Need access right）   
 
+---
 
-### 层号说明
-- 层号 = safetensors key 中 `layers.{N}` 的 **N**
-- **不按组件重排**，原始值直接输出
-- 混合模态模型（如 Gemma-4）：
-  - `layers.0~11` 同时含 audio/vision/text 层
-  - 全部输出，按前缀区分组件
+### Layer Index
+- Layer index = **N** in `layers.{N}` of safetensors keys
+- Raw index, **not re-numbered per component**
+- Multi-modal models (e.g. Gemma-4):
+  - `layers.0~11` may contain audio / vision / text layers
+  - All components output separately, distinguished by prefix
 
-### 示例：Gemma-4-E2B
-| 组件 | 层范围 |
-|------|--------|
-| audio_tower | 0~11 |
-| language_model | 0~34 |
-| vision_tower | 0~15 |
+### Example: Gemma-4-E2B
+| Component | Layer Range |
+|-----------|-------------|
+| audio_tower | 0 ~ 11 |
+| language_model | 0 ~ 34 |
+| vision_tower | 0 ~ 15 |
 
-### 示例：Gemma-4-31B
-| 组件 | 层范围 |
-|------|--------|
-| language(局部层) | 0~59 |
-| language(全局层) | 5,11,17...59 |
-| vision_tower | 0~26 |
+### Example: Gemma-4-31B
+| Component | Layer Range |
+|-----------|-------------|
+| language (local) | 0 ~ 59 |
+| language (global) | 5, 11, 17 … 59 |
+| vision_tower | 0 ~ 26 |
 """
 
 
@@ -61,23 +62,23 @@ def inspect_model(
     progress=gr.Progress()
 ) -> tuple[str, pd.DataFrame]:
     """
-    返回 (结构文本日志, 组件概览DataFrame)
+    Returns (inspection log text, layer structure DataFrame)
     """
     if not model_id.strip():
-        return "❌ 请输入模型 ID", None
+        return "❌ Please enter a model ID.", None
 
     token = hf_token.strip() or None
-    log   = [f"🔬 结构探测：{model_id}\n{'═'*80}\n"]
+    log   = [f"🔬 Structure Inspection: {model_id}\n{'═'*80}\n"]
 
-    # ── 量化检测 ─────────────────────────────────
-    progress(0.05, desc="量化检测...")
+    # ── Quantization check ────────────────────────────────────────────────────
+    progress(0.05, desc="Checking quantization...")
     blocked, qmsg = check_quantization(model_id, token)
-    log.append(f"【量化检测】\n{qmsg}\n{'─'*80}\n")
+    log.append(f"[Quantization Check]\n{qmsg}\n{'─'*80}\n")
     if blocked:
         return "".join(log), None
 
-    # ── config.json ───────────────────────────────
-    progress(0.10, desc="读取 config...")
+    # ── config.json ───────────────────────────────────────────────────────────
+    progress(0.10, desc="Reading config...")
     config_params = {}
     try:
         r = requests.get(
@@ -88,7 +89,7 @@ def inspect_model(
         if r.status_code == 200:
             config_params = extract_config_params(r.json())
             log.append(
-                f"📋 config：\n"
+                f"📋 Config:\n"
                 f"   model_type = {config_params.get('model_type')}\n"
                 f"   hidden     = {config_params.get('hidden_size')}\n"
                 f"   n_heads    = {config_params.get('num_attention_heads')}\n"
@@ -97,45 +98,44 @@ def inspect_model(
                 f"{'─'*80}\n"
             )
     except Exception as e:
-        log.append(f"⚠️  config.json 读取失败：{e}\n")
+        log.append(f"⚠️  Could not read config.json: {e}\n")
 
-    # ── 读取所有 shard headers ────────────────────
-    progress(0.20, desc="读取 shard headers...")
+    # ── Load all shard headers ─────────────────────────────────────────────────
+    progress(0.20, desc="Loading shard headers...")
     try:
         all_headers = load_all_shard_headers(model_id, token)
     except requests.exceptions.HTTPError as e:
         return http_error_msg(e, model_id), None
     except Exception as e:
-        return "".join(log) + f"❌ 读取失败：{e}\n", None
+        return "".join(log) + f"❌ Failed to load headers: {e}\n", None
 
     total_keys = sum(len(h) for h, _ in all_headers.values())
     log.append(
-        f"📦 shard 数：{len(all_headers)}  "
-        f"总 key 数：{total_keys}\n"
+        f"📦 Shards: {len(all_headers)}  "
+        f"Total keys: {total_keys}\n"
         f"{'─'*80}\n"
     )
 
-    # ── 扫描层结构 ────────────────────────────────
-    progress(0.50, desc="扫描层结构...")
+    # ── Scan layer structure ───────────────────────────────────────────────────
+    progress(0.50, desc="Scanning layer structure...")
     profiles = scan_model_structure(all_headers, config_params)
 
     if not profiles:
-        # 打印前30个 key 辅助调试
         sample = []
         for h, _ in list(all_headers.values())[:1]:
             sample = list(h.keys())[:30]
         return (
             "".join(log) +
-            "⚠️  未发现 Q/K/V 层，前30个 key：\n" +
+            "⚠️  No Q/K/V layers found. First 30 keys:\n" +
             "\n".join(sample), None
         )
 
-    # ── 生成结构文本 ──────────────────────────────
-    progress(0.80, desc="生成报告...")
+    # ── Generate structure text ────────────────────────────────────────────────
+    progress(0.80, desc="Generating report...")
     struct_text = summarize_structure(profiles)
     log.append(struct_text)
 
-    # ── 生成概览 DataFrame ────────────────────────
+    # ── Build overview DataFrame ───────────────────────────────────────────────
     rows = []
     for (prefix, layer_idx), p in sorted(profiles.items()):
         rows.append({
@@ -155,43 +155,45 @@ def inspect_model(
 
     df = pd.DataFrame(rows)
 
-    progress(1.0, desc="完成")
+    progress(1.0, desc="Done")
     return "".join(log), df
 
 
 # ─────────────────────────────────────────────
-# Tab1 UI 组件
+# Tab1 UI
 # ─────────────────────────────────────────────
 
 def build_tab_inspect():
-    with gr.Tab("🔬 结构探测"):
+    with gr.Tab("🔬 Inspect"):
         gr.Markdown("""
-        **第一步：先探测模型结构**，自动识别组件、head_dim、K=V共享层。
-        结果供「分析」Tab 使用。
+        **Step 1: Inspect model structure** — auto-detect components, head_dim, and K=V shared layers.
+        Results are used by the **Analyze** tab.
+
+        > No weights are downloaded — structure is inferred from safetensors headers only.
         """)
 
         with gr.Row():
             with gr.Column(scale=3):
                 inspect_model_id = gr.Textbox(
-                    label="HuggingFace 模型 ID",
+                    label="HuggingFace Model ID",
                     placeholder="google/gemma-4-e2b",
                     value="google/gemma-4-e2b"
                 )
                 inspect_token = gr.Textbox(
-                    label="HF Access Token（公开模型可留空）",
+                    label="HF Access Token (leave empty for public models)",
                     type="password"
                 )
-                inspect_btn = gr.Button("🔍 探测结构", variant="secondary")
+                inspect_btn = gr.Button("🔍 Inspect Structure", variant="secondary")
 
             with gr.Column(scale=1):
                 gr.Markdown(SIDEBAR_MD)
 
         inspect_log = gr.Textbox(
-            label="结构探测日志",
+            label="Inspection Log",
             lines=30, max_lines=200
         )
         inspect_table = gr.Dataframe(
-            label="层结构概览表",
+            label="Layer Structure Overview",
             headers=[
                 "prefix", "layer", "d_model", "head_dim", "dim_source",
                 "n_q", "n_kv", "kv_shared", "complete",
