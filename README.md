@@ -9,14 +9,14 @@ python_version: '3.13'
 app_file: app.py
 pinned: false
 license: apache-2.0
-short_description: 'Compute SVD of LLM Q/K/V weights directly from Hugging Face '
+short_description: 'Compute SVD of LLM Q/K/V weights directly from Hugging Face'
 ---
 
 Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
 
 ---
 # Wang's Five Laws — LLM Spectral Analyzer
-## 完整项目文档 README.md
+## 完整项目文档 README.md（6-Tab Gradio App）
 
 ---
 
@@ -51,6 +51,7 @@ Check out the configuration reference at https://huggingface.co/docs/hub/spaces-
 9. [关键设计决策](#9-关键设计决策)
 10. [部署说明](#10-部署说明)
 11. [依赖清单](#11-依赖清单)
+12. [改动历史](#12-改动历史)
 
 ---
 
@@ -90,7 +91,7 @@ Check out the configuration reference at https://huggingface.co/docs/hub/spaces-
 ```
 ┌─────────────────────────────────────────────────────┐
 │                      app.py                          │
-│              主入口，组装所有 Tab                      │
+│              主入口，组装所有 6 个 Tab                 │
 │              启动时调用 init_db()                      │
 └──────┬──────────────────────────────────────────────┘
        │ 调用
@@ -103,10 +104,11 @@ Check out the configuration reference at https://huggingface.co/docs/hub/spaces-
 │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  │
 │         │                │                │          │
 │         └────────────────┼────────────────┘          │
-│  ┌─────────────┐         │                           │
-│  │tab_database │─────────┘                           │
-│  │数据库浏览    │                                      │
-│  └─────────────┘                                     │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │
+│  │tab_database │  │ tab_plot    │  │ tab_tables  │  │
+│  │数据库浏览    │  │ 作图导出    │  │ 论文表格     │  │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  │
+│         └────────────────┼────────────────┘          │
 └──────┬──────────────────────────┬───────────────────┘
        │ 调用                      │ 调用
        ▼                          ▼
@@ -121,6 +123,15 @@ Check out the configuration reference at https://huggingface.co/docs/hub/spaces-
 │                 │    │                             │
 │ metrics.py      │    │  SQLite 文件                 │
 │ 计算五定律       │    │  /data/wang_laws.db          │
+│                 │    │                             │
+│ plotter.py      │    │                             │
+│ matplotlib静态图 │    │                             │
+│                 │    │                             │
+│ plotter_plotly  │    │                             │
+│ Plotly交互图    │    │                             │
+│                 │    │                             │
+│ table_gen.py    │    │                             │
+│ 论文表格生成     │    │                             │
 └─────────────────┘    └─────────────────────────────┘
 ```
 
@@ -139,7 +150,7 @@ Check out the configuration reference at https://huggingface.co/docs/hub/spaces-
 ```
 项目根目录/
 │
-├── app.py                    # 主入口：初始化DB，组装4个Tab
+├── app.py                    # 主入口：初始化DB，组装6个Tab
 ├── requirements.txt          # 依赖清单
 │
 ├── core/                     # 计算引擎（纯Python，无副作用）
@@ -148,12 +159,15 @@ Check out the configuration reference at https://huggingface.co/docs/hub/spaces-
 │   ├── debug.py              # 调试输出工具（受config.DEBUG控制）
 │   ├── fetcher.py            # HTTP Range Request 读取远程权重
 │   ├── layer_profile.py      # 自动推断模型层结构
-│   └── metrics.py            # 计算王氏五定律全部指标
+│   ├── metrics.py            # 计算王氏五定律全部指标
+│   ├── plotter.py            # matplotlib 静态图（4×3，18×20in，300dpi）
+│   ├── plotter_plotly.py     # Plotly 原生交互图（12×1，全宽）
+│   └── table_gen.py          # 论文表格生成（6张表，LaTeX/Markdown/CSV）
 │
 ├── db/                       # 数据持久化层
 │   ├── __init__.py           # 空文件
 │   ├── schema.py             # 建表SQL + 数据库连接
-│   ├── writer.py             # 写入分析结果 + 断点续传检查
+│   ├── writer.py             # 写入分析结果 + 断点续传 + 级联删除
 │   └── reader.py             # 查询排行榜、模型详情、原始数据
 │
 └── ui/                       # Gradio 界面层
@@ -161,7 +175,9 @@ Check out the configuration reference at https://huggingface.co/docs/hub/spaces-
     ├── tab_inspect.py        # Tab1：模型结构探测
     ├── tab_analyze.py        # Tab2：分析模型 + 写库
     ├── tab_leaderboard.py    # Tab3：王氏评分排行榜
-    └── tab_database.py       # Tab4：数据库浏览
+    ├── tab_database.py       # Tab4：数据库浏览 + 模型删除
+    ├── tab_plot.py           # Tab5：作图（Plotly交互 + matplotlib导出）
+    └── tab_tables.py         # Tab6：论文表格生成
 ```
 
 ---
@@ -426,24 +442,41 @@ def get_db_path() -> str:
 
 #### `db/writer.py`
 
-| 函数                   | 签名                                                | 用途                                             |
-| ---------------------- | --------------------------------------------------- | ------------------------------------------------ |
-| `infer_layer_type`     | `(kv_shared: bool)`                                 | `True→"global"`, `False→"standard"`              |
-| `get_analyzed_layers`  | `(conn, model_id, prefix)`                          | 返回已完成的层号集合（断点续传用）               |
-| `is_layer_complete`    | `(conn, model_id, prefix, layer, expected_records)` | 检查某层记录数是否达到预期                       |
-| `upsert_model`         | `(conn, model_id, model_type, notes)`               | 写入/更新模型元数据                              |
-| `upsert_component`     | `(conn, model_id, prefix, n_layers, ...)`           | 写入/更新组件信息                                |
-| `write_layer_records`  | `(conn, model_id, records: list[dict])`             | 批量写入一层的逐头数据（INSERT OR REPLACE）      |
-| `update_model_summary` | `(conn, model_id, prefix)`                          | 重算并写入model_summary的all/standard/global三行 |
+| 函数                     | 签名                                                | 用途                                                                      |
+| ------------------------ | --------------------------------------------------- | ------------------------------------------------------------------------- |
+| `infer_layer_type`       | `(kv_shared: bool)`                                 | `True→"global"`, `False→"standard"`                                       |
+| `infer_modality`         | `(prefix: str)`                                     | 从 prefix 推断模态：language/vision/audio                                 |
+| `check_write_permission` | `(admin_token: str)`                                | 验证 WRITE_TOKEN，返回 bool                                               |
+| `get_analyzed_layers`    | `(conn, model_id, prefix)`                          | 返回已完成的层号集合（断点续传用）                                        |
+| `is_layer_complete`      | `(conn, model_id, prefix, layer, expected_records)` | 检查某层记录数是否达到预期                                                |
+| `upsert_model`           | `(conn, model_id, model_type, notes)`               | 写入/更新模型元数据                                                       |
+| `upsert_component`       | `(conn, model_id, prefix, n_layers, ...)`           | 写入/更新组件信息                                                         |
+| `write_layer_records`    | `(conn, model_id, records: list[dict])`             | 批量写入一层的逐头数据（INSERT OR REPLACE）                               |
+| `_pseudobulk_col`        | `(rows, col_name: str)`                             | Pseudo-bulk 两步聚合：消除 GQA 伪重复计数                                 |
+| `_calc_summary_row`      | `(rows, model_id, prefix, layer_type)`              | 用 pseudo-bulk 计算单行汇总统计                                           |
+| `update_model_summary`   | `(conn, model_id, prefix)`                          | 重算并写入 model_summary 的 all/standard/global 三行                      |
+| `refresh_all_summaries`  | `(conn)`                                            | 遍历所有(model_id, prefix)重跑 update_model_summary，供 Tab3 Refresh 调用 |
+| `delete_model`           | `(conn, model_id, admin_token)`                     | 级联删除模型所有数据，需 WRITE_TOKEN 验证                                 |
 
 **`update_model_summary` 逻辑：**
 ```
 对 layer_type in ["all", "standard", "global"]：
   从 layer_head_metrics 查对应行
-  计算各指标的 median/mean
-  wang_score 统一用 standard 层的 median(ssr_QK) 计算
+  用 _pseudobulk_col() 两步聚合（先按 kv_head 组内 median，再跨组 median）
+    → 消除 GQA 模型（如 LLaMA-3 32Q/8KV）的伪重复计数偏差
+  wang_score 统一用 standard 层的 pseudo-bulk median(ssr_QK) 计算
     （即使写 all/global 行，wang_score 也来自 standard 层）
   INSERT OR REPLACE 写入 model_summary
+```
+
+**`delete_model` 逻辑：**
+```
+1. check_write_permission(admin_token) → 失败直接返回错误
+2. 查 models 表确认模型存在
+3. 统计各子表行数（用于返回日志）
+4. 按顺序级联删除：
+   layer_head_metrics → model_summary → components → models
+5. 返回 (True, 详细删除日志)
 ```
 
 ---
@@ -501,7 +534,7 @@ def build_tab_inspect() -> (inspect_model_id, inspect_token):
 **函数：**
 
 ```python
-def run_analysis(model_id, hf_token, start_layer, end_layer, progress)
+def run_analysis(model_id, hf_token, start_layer, end_layer, admin_token, progress)
     -> (str, pd.DataFrame):
     """
     完整工作流程：
@@ -510,31 +543,33 @@ def run_analysis(model_id, hf_token, start_layer, end_layer, progress)
     1.  init_db()                          ← 获取DB连接
     2.  check_quantization()               ← 量化检测
     3.  读取 config.json
-    4.  upsert_model()                     ← 写模型元数据到DB
-    5.  load_all_shard_headers()           ← 读所有分片header
-    6.  scan_model_structure()             ← 构建LayerProfile字典
+    4.  load_all_shard_headers()           ← 读所有分片header
+        （404/网络错误 → 提前返回，DB零污染）
+    5.  scan_model_structure()             ← 构建LayerProfile字典
+    6.  upsert_model()                     ← 写模型元数据到DB
+        （注意：故意在 shard headers 加载成功后才写，
+          防止模型名拼写错误产生脏数据）
     7.  upsert_component() for each prefix ← 写组件信息到DB
-    8.  按 start_layer~end_layer 过滤层
 
     [断点续传检查]
-    9.  get_analyzed_layers() for each prefix
+    8.  get_analyzed_layers() for each prefix
         → done_layers: dict[prefix, set[int]]
         → 打印待分析层和已跳过层
 
     [逐层分析循环]
     for each (prefix, layer_idx) in filtered（按prefix+layer排序）:
-      10. 检查：layer_idx in done_layers[prefix] → continue（跳过）
-      11. load_tensor_remote(Q)              ← HTTP Range Request
-      12. load_tensor_remote(K)
-      13. kv_shared ? W_v=W_k.clone() : load_tensor_remote(V)
-      14. analyze_layer(W_q, W_k, W_v, prof) ← 计算五定律
-      15. write_layer_records(conn, model_id, records) ← 写DB
-      16. update_model_summary(conn, model_id, prefix) ← 更新排行榜
-      17. del W_q, W_k, W_v                 ← 释放内存
+      9.  检查：layer_idx in done_layers[prefix] → continue（跳过）
+      10. load_tensor_remote(Q)              ← HTTP Range Request
+      11. load_tensor_remote(K)
+      12. kv_shared ? W_v=W_k.clone() : load_tensor_remote(V)
+      13. analyze_layer(W_q, W_k, W_v, prof) ← 计算五定律
+      14. write_layer_records(conn, model_id, records) ← 写DB
+      15. update_model_summary(conn, model_id, prefix) ← 更新排行榜
+      16. del W_q, W_k, W_v                 ← 释放内存
 
     [收尾]
-    18. 更新 models.analyze_sec（总耗时）
-    19. summarize_records()                  ← 生成汇总文本
+    17. 更新 models.analyze_sec（总耗时）
+    18. summarize_records()                  ← 生成汇总文本
     返回：(日志文本, 逐头结果DataFrame)
     """
 
@@ -544,8 +579,8 @@ def build_tab_analyze() -> (model_id_input, token_input):
 
 **UI组件：**
 ```
-模型ID + Token + 起始层号 + 结束层号 + 分析按钮
-侧边栏：推荐模型列表 + 层号说明
+模型ID + Token + 起始层号 + 结束层号 + Admin Write Token + 分析按钮
+侧边栏：推荐模型列表 + 层号说明 + Reviewer Note（留空token可只读分析）
 → 分析日志文本框（逐头详情）
 → 逐头结果表格（37列全指标）
 ```
@@ -566,10 +601,12 @@ def _format_leaderboard(df: pd.DataFrame) -> pd.DataFrame:
     - 选择展示列（隐藏冗余列）
     """
 
-def load_leaderboard(prefix_filter, layer_type) -> (pd.DataFrame, str):
+def load_leaderboard(modality, layer_type) -> (pd.DataFrame, str):
     """
+    调用 refresh_all_summaries(conn) 静默重算所有模型汇总
+      → 自动将历史数据迁移到 pseudo-bulk 聚合
     调用 reader.get_leaderboard()
-    prefix_filter 空字符串 → None（不过滤）
+    modality 控制按模态过滤（language/vision/audio/all）
     layer_type="all" → 实际查 "standard"（排行榜默认用standard）
     """
 
@@ -600,19 +637,124 @@ def load_model_detail(model_id) -> (pd.DataFrame, str):
     调用 get_resume_status() for each prefix → 断点续传状态文本
     """
 
+def run_delete_model(model_id, admin_token) -> (str, pd.DataFrame):
+    """
+    调用 db/writer.delete_model() 执行级联删除
+    需要 Admin Write Token 验证
+    删除成功后自动刷新 models_table
+    返回 (状态文本, 刷新后的模型列表DataFrame)
+    """
+
 def load_layer_data(model_id, prefix, layer_type, start_layer, end_layer)
     -> (pd.DataFrame, str):
     """调用 get_layer_metrics()，返回逐头原始数据"""
 
 def build_tab_database():
     """
-    UI分为4个区块：
+    UI分为5个区块：
     1. 数据库统计（行数+文件大小）
     2. 已分析模型列表
-    3. 模型详情+断点续传状态
-    4. 逐头原始数据查询（支持按prefix/layer_type/层号范围过滤）
+    3. 🗑️ 删除模型（Model ID + Admin Token + Delete按钮，variant="stop"红色警示）
+       → 删除成功后自动刷新模型列表
+    4. 模型详情+断点续传状态
+    5. 逐头原始数据查询（支持按modality/layer_type/层号范围过滤）
     """
 ```
+
+---
+
+#### `ui/tab_plot.py` — Tab5：作图
+
+**两条独立渲染路径（无嵌套 gr.Tabs()，用两个并排按钮区分）：**
+
+| 按钮          | 引擎                     | 速度 | 输出                         |
+| ------------- | ------------------------ | ---- | ---------------------------- |
+| ⚡ Interactive | `core/plotter_plotly.py` | ~2s  | 浏览器内交互，hover/zoom     |
+| 🖨️ Export      | `core/plotter.py`        | ~30s | PNG(300dpi) + PDF + SVG 下载 |
+
+**函数：**
+
+```python
+def gen_single_plotly(model_id, modality, start_l, end_l, show_band) -> (go.Figure, str):
+    """从DB加载数据，调用 plotly_single()，返回 Plotly Figure"""
+
+def gen_single_export(model_id, modality, start_l, end_l, show_band) -> (str, img, png, pdf, svg, zip):
+    """从DB加载数据，调用 plot_single_model()，保存 PNG/PDF/SVG，返回下载链接"""
+
+def gen_compare_plotly(model_a, model_b, modality, start_l, end_l, show_band, show_delta) -> (go.Figure, str):
+    """双模型对比，调用 plotly_compare()"""
+
+def gen_compare_export(model_a, model_b, modality, start_l, end_l, show_band, show_delta) -> (str, img, png, pdf, svg, zip):
+    """双模型对比导出，调用 plot_compare_models()"""
+
+def build_tab_plot():
+    """
+    UI分为两个 Accordion：
+    1. 📊 Single Model：选模型 → ⚡Interactive / 🖨️Export
+    2. 📊 Two-Model Comparison：选A+B → ⚡Interactive / 🖨️Export + Δ填充开关
+    共享控件：Modality / Start Layer / End Layer / IQR band 开关
+    """
+```
+
+**12子图布局（Plotly 12×1 全宽）：**
+```
+行 0：pearson_QK       定律1 谱线性对齐
+行 1：ssr_QK           定律2 谱形状保真度
+行 2：alpha_QK         定律1+2 尺度因子α
+行 3：sigma_max_Q      定律3 最大奇异值(Q)
+行 4：sigma_max_K      定律3 最大奇异值(K)
+行 5：cond_Q + cond_K  定律3 条件数κ（双线，对数坐标）
+行 6：cosU_QK          定律4 输出子空间 Q-K
+行 7：cosU_QV          定律4 输出子空间 Q-V（超正交）
+行 8：cosU_KV          定律4 输出子空间 K-V（超正交）
+行 9：cosV_QK          定律5 输入子空间 Q-K
+行10：cosV_QV          定律5 输入子空间 Q-V
+行11：cosV_KV          定律5 输入子空间 K-V
+```
+
+---
+
+#### `ui/tab_tables.py` — Tab6：论文表格
+
+**一键生成6张论文表格，数据来源：language modality + standard layers only。**
+
+**函数：**
+
+```python
+def generate_tables(selected_models, table2_model_a, table2_model_b, group_text)
+    -> (status, t1~t6 DataFrames, latex_str, md_str, csv×6, latex_file, md_file, zip):
+    """
+    工作流程：
+    1. _load_all_models(selected_models) ← 从DB读取所有选中模型数据
+    2. _parse_groups(group_text)         ← 解析用户定义的层组（如"0-11,12-23"）
+    3. generate_all_tables()             ← core/table_gen.py 生成6张表
+    4. format_all_latex() / format_all_markdown() ← 格式化输出
+    5. 保存 CSV × 6 + .tex + .md → 打包 ZIP
+    返回：所有输出供 Gradio 组件展示和下载
+    """
+
+def build_tab_tables():
+    """
+    UI分为：
+    - 模型多选框（CheckboxGroup）+ Refresh按钮
+    - Table2专用：Model A / Model B 下拉 + 层组输入框
+    - 🚀 Generate All Tables 按钮
+    - 6个 Accordion，每个内含 DataFrame + CSV下载
+    - LaTeX / Markdown 代码框（可直接复制粘贴）
+    - 批量下载：.tex / .md / ZIP
+    """
+```
+
+**6张表说明：**
+
+| 表格    | 内容                                       | 对应定律  |
+| ------- | ------------------------------------------ | --------- |
+| Table 1 | 跨模型汇总：Pearson r, SSR                 | 定律1 & 2 |
+| Table 2 | SSR 层组趋势（RL改善效果，用户自定义层组） | 定律2     |
+| Table 3 | 输出子空间 cosU：Q-K, Q-V, K-V + 随机基线  | 定律4     |
+| Table 4 | 输入子空间 cosV：Q-K, Q-V, K-V + 随机基线  | 定律5     |
+| Table 5 | 条件数κ：全层/第0层/深层 分别统计          | 定律3     |
+| Table 6 | Wang Score 排行榜（按分降序）              | 定律1 & 2 |
 
 ---
 
@@ -624,13 +766,15 @@ init_db()   # 建表，幂等
 
 # Gradio Blocks
 with gr.Blocks(...) as demo:
-    # 标题 + 五定律表格 + DOI徽章
+    # 标题 + 五定律表格（英中双语并排）+ DOI徽章
 
     with gr.Tabs():
         inspect_model_id, inspect_token = build_tab_inspect()
         analyze_model_id, analyze_token = build_tab_analyze()
         build_tab_leaderboard()
         build_tab_database()
+        build_tab_plot()
+        build_tab_tables()
 
     # Tab1 → Tab2 联动（避免重复输入）
     inspect_model_id.change(fn=lambda x:x,
@@ -834,9 +978,9 @@ app.py
 │       ├── init_db()                      [db/schema.py]
 │       ├── check_quantization()           [core/fetcher.py]
 │       ├── extract_config_params()        [core/layer_profile.py]
-│       ├── upsert_model()                 [db/writer.py]
-│       ├── load_all_shard_headers()       [core/fetcher.py]
+│       ├── load_all_shard_headers()       [core/fetcher.py]  ← 成功后才写DB
 │       ├── scan_model_structure()         [core/layer_profile.py]
+│       ├── upsert_model()                 [db/writer.py]     ← 在此之后写入
 │       ├── upsert_component()             [db/writer.py]
 │       ├── get_analyzed_layers()          [db/writer.py]
 │       ├── load_tensor_remote() ×3        [core/fetcher.py]
@@ -851,25 +995,61 @@ app.py
 │       ├── write_layer_records()          [db/writer.py]
 │       │   └── infer_layer_type()
 │       ├── update_model_summary()         [db/writer.py]
+│       │   ├── _pseudobulk_col()
 │       │   └── _calc_summary_row()
 │       └── summarize_records()            [core/metrics.py]
 │
 ├── build_tab_leaderboard()                [ui/tab_leaderboard.py]
 │   └── load_leaderboard()
 │       ├── init_db()                      [db/schema.py]
+│       ├── refresh_all_summaries()        [db/writer.py]
+│       │   └── update_model_summary() ×N
 │       ├── get_leaderboard()              [db/reader.py]
 │       └── _format_leaderboard()
 │
-└── build_tab_database()                   [ui/tab_database.py]
-    ├── load_db_stats()
-    │   └── get_db_stats()                 [db/schema.py]
-    ├── load_model_list()
-    │   └── get_analyzed_models()          [db/reader.py]
-    ├── load_model_detail()
-    │   ├── get_model_summary()            [db/reader.py]
-    │   └── get_resume_status()            [db/reader.py]
-    └── load_layer_data()
-        └── get_layer_metrics()            [db/reader.py]
+├── build_tab_database()                   [ui/tab_database.py]
+│   ├── load_db_stats()
+│   │   └── get_db_stats()                 [db/schema.py]
+│   ├── load_model_list()
+│   │   └── get_analyzed_models()          [db/reader.py]
+│   ├── run_delete_model()
+│   │   ├── delete_model()                 [db/writer.py]
+│   │   │   └── check_write_permission()
+│   │   └── load_model_list()              ← 删除后自动刷新
+│   ├── load_model_detail()
+│   │   ├── get_model_summary()            [db/reader.py]
+│   │   └── get_resume_status()            [db/reader.py]
+│   └── load_layer_data()
+│       └── get_layer_metrics()            [db/reader.py]
+│
+├── build_tab_plot()                       [ui/tab_plot.py]
+│   ├── gen_single_plotly()
+│   │   ├── get_layer_metrics()            [db/reader.py]
+│   │   └── plotly_single()               [core/plotter_plotly.py]
+│   ├── gen_single_export()
+│   │   ├── get_layer_metrics()            [db/reader.py]
+│   │   ├── plot_single_model()            [core/plotter.py]
+│   │   └── save_figure()
+│   ├── gen_compare_plotly()
+│   │   ├── get_layer_metrics() ×2         [db/reader.py]
+│   │   └── plotly_compare()              [core/plotter_plotly.py]
+│   └── gen_compare_export()
+│       ├── get_layer_metrics() ×2         [db/reader.py]
+│       ├── plot_compare_models()          [core/plotter.py]
+│       └── save_figure()
+│
+└── build_tab_tables()                     [ui/tab_tables.py]
+    └── generate_tables()
+        ├── get_layer_metrics() ×N         [db/reader.py]
+        ├── generate_all_tables()          [core/table_gen.py]
+        │   ├── make_table1()
+        │   ├── make_table2()
+        │   ├── make_table3()
+        │   ├── make_table4()
+        │   ├── make_table5()
+        │   └── make_table6()
+        ├── format_all_latex()
+        └── format_all_markdown()
 ```
 
 ---
@@ -904,6 +1084,28 @@ Gemma-4-31B 每6层有一个全局层，V权重不存在（K和V共享）。
 ### 每个(model_id, prefix)在排行榜中是一行
 排行榜以 `(model_id, prefix)` 为单位，
 多模态模型（如Gemma-4）的language_model和vision_tower分别占一行。
+
+### 防脏数据写入（Lazy Write）
+`upsert_model()` 和 `upsert_component()` 故意推迟到 `load_all_shard_headers()` 成功之后才调用。
+模型名拼写错误（如 "Meta-Llama-3-70B-intruct" 少一个s）会在 HF 返回 404 时提前 return，
+DB 中零污染。旧版本在量化检测通过后立即写入，会留下只有名字没有数据的孤立行，污染 Tab4/5/6。
+
+### Pseudo-bulk 两步聚合（GQA 伪重复问题）
+GQA 模型（如 LLaMA-3-8B 32Q/8KV）中，同一 KV head 下的多个 Q head 共享同一 K，
+彼此强相关。若直接对所有头做 median，等价于对 KV head 的指标重复计数 group 次（伪重复）。
+标准做法（Nature Comms 2021）：
+```
+Step 1: groupby(layer, kv_head).median()  → 每KV head一个值，消除组内相关
+Step 2: 对Step1结果做 median/mean         → 每层一个无偏代表值
+```
+实现在 `db/writer._pseudobulk_col()` 和 `core/plotter._aggregate_by_layer()`。
+Tab3 Refresh 按钮触发 `refresh_all_summaries()` 自动将历史数据重算为 pseudo-bulk。
+
+### 级联删除与写入权限统一验证
+`delete_model()` 和所有写库操作均通过同一个 `check_write_permission(admin_token)` 验证，
+后者对比环境变量 `WRITE_TOKEN`（HF Space Secrets 注入）。
+删除顺序严格遵循外键依赖：`layer_head_metrics → model_summary → components → models`。
+删除后返回各表实际删除行数，便于审计确认。
 
 ---
 
@@ -1004,6 +1206,8 @@ numpy             # 数值计算（统计汇总）
 scipy             # spearman相关系数
 torch             # SVD分解（torch.linalg.svd）
 huggingface_hub   # list_repo_files（文件列表）
+matplotlib        # 静态图导出（PNG/PDF/SVG，300dpi，论文级）
+plotly            # 交互图（12×1全宽，浏览器内hover/zoom）
 ```
 
 Python 内置（无需安装）：
@@ -1015,3 +1219,41 @@ re         # 正则提取层号
 datetime   # 时间戳
 dataclasses # LayerProfile数据结构
 ```
+
+---
+
+## 12. 改动历史
+
+### v0.1 — 初始版本（Tab1~4）
+- Tab1 Inspect：模型结构探测，零下载，仅读 safetensors header
+- Tab2 Analyze：HTTP Range Request 逐层分析，写库，断点续传
+- Tab3 Leaderboard：Wang Score 排行榜
+- Tab4 Database：数据库浏览，逐头原始数据查询
+
+### v0.2 — 作图与论文表格（Tab5~6）
+- 新增 `core/plotter.py`：matplotlib 4×3 静态图，18×20in @ 300dpi
+- 新增 `core/plotter_plotly.py`：原生 Plotly 12×1 交互图，全宽自适应
+- 新增 `ui/tab_plot.py`（Tab5）：两条渲染路径（⚡Interactive / 🖨️Export）
+- 新增 `core/table_gen.py`：6张论文表格生成（LaTeX/Markdown/CSV）
+- 新增 `ui/tab_tables.py`（Tab6）：一键生成，批量下载
+- `app.py` 双语改造：英文在左，中文在右，两列并排表格
+
+### v0.3 — Pseudo-bulk 聚合 + 防脏数据 + 级联删除
+**问题修复：**
+- `ui/tab_analyze.py`：`upsert_model` / `upsert_component` 推迟到 `load_all_shard_headers()` 成功后执行，防止模型名拼错产生脏数据
+
+**新功能：**
+- `db/writer.py`：新增 `_pseudobulk_col()`，`update_model_summary()` 改用 pseudo-bulk 两步聚合，消除 GQA 伪重复计数偏差
+- `db/writer.py`：新增 `refresh_all_summaries()`，Tab3 Refresh 按钮触发，自动将历史数据重算为 pseudo-bulk
+- `db/writer.py`：新增 `delete_model(conn, model_id, admin_token)`，级联删除模型所有数据，需 WRITE_TOKEN 验证
+- `ui/tab_database.py`：新增 🗑️ Delete Model 区块，删除成功后自动刷新模型列表
+- `ui/tab_inspect.py`：全文翻译为英文，逻辑不变
+
+**改动文件汇总：**
+
+| 文件                 | 类型 | 说明                                                    |
+| -------------------- | ---- | ------------------------------------------------------- |
+| `db/writer.py`       | 更新 | 新增 pseudo-bulk / refresh_all_summaries / delete_model |
+| `ui/tab_analyze.py`  | 修复 | upsert_model 推迟到 shard headers 加载成功后            |
+| `ui/tab_database.py` | 更新 | 新增删除模型 UI                                         |
+| `ui/tab_inspect.py`  | 重构 | 全文英文化                                              |
