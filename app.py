@@ -12,6 +12,7 @@ from ui.tab_leaderboard import build_tab_leaderboard
 from ui.tab_database import build_tab_database
 from ui.tab_plot import build_tab_plot
 from ui.tab_tables import build_tab_tables
+from ui.tab_pythia import build_tab_pythia
 
 # ── 启动时初始化数据库 ────────────────────────
 init_db()
@@ -67,6 +68,7 @@ with gr.Blocks(
         build_tab_database()
         build_tab_plot()
         build_tab_tables()
+        build_tab_pythia()
 
     # ── Tab1 → Tab2 联动 ──────────────────────
     inspect_model_id.change(

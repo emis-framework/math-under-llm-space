@@ -256,3 +256,109 @@ def check_quantization(model_id: str, token: str = None) -> tuple[bool, str]:
         warnings.append(f"⚠️  header 检测失败：{e}")
 
     return False, "\n".join(warnings) if warnings else "✅ 未检测到量化，可以正常分析"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 追加到 core/fetcher.py 末尾
+# 新增函数：load_tensors_batch()
+# 作用：一次 Range Request 读取多个连续 tensor，用于 Pythia 多层 QKV 批量读取
+# 依赖：DTYPE_MAP, dprint（已在 fetcher.py 中定义）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_tensors_batch(
+    url: str,
+    tensor_names: list,
+    header: dict,
+    header_size: int,
+    token: str = None,
+) -> dict:
+    """
+    合并多个 tensor 的字节范围，发一次 Range Request 批量读取。
+
+    参数：
+        url          : safetensors 文件的完整 URL
+        tensor_names : 要读取的 tensor key 列表
+        header       : read_safetensors_header() 返回的 header dict
+        header_size  : header 字节数（read_safetensors_header() 第二个返回值）
+        token        : HF Access Token（可选）
+
+    返回：
+        {tensor_name: torch.Tensor (float32)}
+        不在 header 中的 key 静默跳过。
+
+    注意：
+        假设 tensor_names 在文件中字节范围连续（Pythia QKV 层满足此条件）。
+        合并范围 = [min_start, max_end]，中间若有空隙也一并读入（通常 < 1KB）。
+    """
+    import time
+
+    hdrs = {"Authorization": f"Bearer {token}"} if token else {}
+
+    # ── 收集每个 tensor 的绝对字节范围 ──────────────────────────────────────
+    infos = []
+    for name in tensor_names:
+        if name not in header:
+            continue
+        entry = header[name]
+        dtype_str = entry["dtype"]
+        if dtype_str not in DTYPE_MAP:
+            dprint(f"[BATCH] 跳过未知 dtype={dtype_str}: {name}")
+            continue
+        start, end = entry["data_offsets"]
+        abs_start = 8 + header_size + start
+        abs_end   = 8 + header_size + end - 1
+        infos.append((name, abs_start, abs_end, entry["shape"], dtype_str))
+
+    if not infos:
+        return {}
+
+    # ── 合并成一个连续区间 ────────────────────────────────────────────────────
+    total_start = min(i[1] for i in infos)
+    total_end   = max(i[2] for i in infos)
+    total_mb    = (total_end - total_start + 1) / 1024 / 1024
+
+    dprint(f"[BATCH] {len(infos)} tensors  {total_mb:.1f} MB  "
+           f"bytes={total_start}-{total_end}")
+
+    # ── 带重试的单次 Range Request ────────────────────────────────────────────
+    blob = None
+    for attempt in range(5):
+        try:
+            r = requests.get(
+                url,
+                headers={**hdrs, "Range": f"bytes={total_start}-{total_end}"},
+                timeout=300,
+            )
+            r.raise_for_status()
+            expected = total_end - total_start + 1
+            if len(r.content) != expected:
+                dprint(f"[BATCH] 数据不完整 {len(r.content)}/{expected}，"
+                       f"重试 {attempt+1}/5")
+                time.sleep(3 * (attempt + 1))
+                continue
+            blob = r.content
+            break
+        except Exception as e:
+            dprint(f"[BATCH] 失败({attempt+1}/5): {e}")
+            time.sleep(3 * (attempt + 1))
+
+    if blob is None:
+        raise RuntimeError(f"load_tensors_batch 重试 5 次失败: {url}")
+
+    # ── 从 blob 切片还原每个 tensor ───────────────────────────────────────────
+    result = {}
+    for name, abs_start, abs_end, shape, dtype_str in infos:
+        torch_dtype, _ = DTYPE_MAP[dtype_str]
+        offset = abs_start - total_start
+        size   = abs_end - abs_start + 1
+        chunk  = blob[offset: offset + size]
+
+        if torch_dtype == torch.bfloat16:
+            t = torch.frombuffer(bytearray(chunk), dtype=torch.int16
+                                 ).view(torch.bfloat16)
+        else:
+            t = torch.frombuffer(bytearray(chunk), dtype=torch_dtype)
+
+        result[name] = t.reshape(shape).float()
+        dprint(f"[BATCH]   {name} {list(shape)} OK")
+
+    return result
