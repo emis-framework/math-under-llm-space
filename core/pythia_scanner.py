@@ -9,6 +9,9 @@ Pythia checkpoint SSR/UniIso 动态扫描
 架构（MHA，1Q对1K）：
   160m: 12层 12头 d_model=768  d_head=64
   410m: 24层 16头 d_model=1024 d_head=64
+  1B:   16层  8头 d_model=2048 d_head=256
+  1.4B: 24层 16头 d_model=2048 d_head=128
+  2.8B: 32层 32头 d_model=2560 d_head=80
 
 输出：
   /data/pythia_{size}_ssr_{run_ts}.csv   完整 per-head 记录
@@ -46,6 +49,27 @@ PYTHIA_CONFIGS = {
         "n_heads":   16,
         "d_model":   1024,
         "d_head":    64,
+    },
+    "1b": {
+        "model_id": "EleutherAI/pythia-1b",
+        "n_layers": 16,
+        "n_heads": 8,
+        "d_model": 2048,
+        "d_head": 256,
+    },
+    "1.4b": {
+        "model_id": "EleutherAI/pythia-1.4b",
+        "n_layers": 24,
+        "n_heads": 16,
+        "d_model": 2048,
+        "d_head": 128,
+    },
+    "2.8b": {
+        "model_id": "EleutherAI/pythia-2.8b",
+        "n_layers": 32,
+        "n_heads": 32,
+        "d_model": 2560,
+        "d_head": 80,
     },
 }
 
