@@ -161,7 +161,7 @@ def build_tab_pythia():
         # ── 控制面板 ──────────────────────────────────────────────────────────
         with gr.Row():
             dd_size = gr.Dropdown(
-                choices=["160m", "410m"],
+                choices=["160m", "410m", "1B", "1.4B", "2.8B"],
                 value="160m",
                 label="Model Size",
             )
