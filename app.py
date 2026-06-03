@@ -16,7 +16,7 @@ from ui.tab_pythia import build_tab_pythia
 
 # 临时：删除错误的2.8b数据，跑一次后删掉这两行
 import os
-_bad = "/data/pythia_2.8b_ssr_20260602_233001.csv"
+_bad = "/data/pythia_2.8b_ssr_20260603_111813.csv"
 if os.path.exists(_bad): os.remove(_bad)
 
 # ── 启动时初始化数据库 ────────────────────────
