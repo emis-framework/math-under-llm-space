@@ -141,6 +141,34 @@ def checkpoint_url(model_id: str, step: int) -> str:
     """
     return f"https://huggingface.co/{model_id}/resolve/step{step}/model.safetensors"
 
+def get_checkpoint_urls(model_id: str, step: int) -> list:
+    """
+    返回该checkpoint的safetensors文件URL列表。
+    单文件：返回[model.safetensors]
+    分片：  读index.json，返回包含QKV权重的分片URL列表（去重）
+    """
+    import requests
+    base = f"https://huggingface.co/{model_id}/resolve/step{step}"
+
+    # 先试单文件
+    single = f"{base}/model.safetensors"
+    r = requests.get(single, headers={"Range": "bytes=0-7"}, timeout=15)
+    if r.status_code == 206 and len(r.content) == 8:
+        return [single]
+
+    # 分片：读index.json
+    idx_url = f"{base}/model.safetensors.index.json"
+    r2 = requests.get(idx_url, timeout=15)
+    wmap = r2.json()["weight_map"]
+    # 找所有QKV相关的分片（去重，保持顺序）
+    qkv_shards = []
+    seen = set()
+    for k, shard in wmap.items():
+        if "query_key_value" in k and shard not in seen:
+            qkv_shards.append(f"{base}/{shard}")
+            seen.add(shard)
+    return qkv_shards
+
 
 # ── 单个 checkpoint 扫描 ──────────────────────────────────────────────────────
 
@@ -154,7 +182,7 @@ def scan_checkpoint(model_id: str, step: int, cfg: dict, token: str = None) -> l
     d_head   = cfg["d_head"]
     d_model  = cfg["d_model"]
 
-    url = checkpoint_url(model_id, step)
+    url = get_checkpoint_urls(model_id, step)
     dprint(f"[SCAN] step={step}  url={url}")
 
     # 读 header
