@@ -219,6 +219,13 @@ def scan_checkpoint(model_id: str, step: int, cfg: dict, token: str = None) -> l
             url, qkv_keys, header, header_size, token=token)
     tensors = all_tensors
 
+    # 临时debug，确认后删除
+    for _l in [0, 1, 2]:
+        _key = f"gpt_neox.layers.{_l}.attention.query_key_value.weight"
+        if _key in tensors:
+            _w = tensors[_key].numpy()
+            dprint(f"[DEBUG] layer{_l} shape={_w.shape} mean={_w.mean():.6f} std={_w.std():.6f} sample={_w[0,0]:.6f}")    
+
     records = []
     for layer in range(n_layers):
         key = f"gpt_neox.layers.{layer}.attention.query_key_value.weight"

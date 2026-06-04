@@ -21,22 +21,22 @@ from ui.tab_pythia import build_tab_pythia
 
 # # 临时修改csv字段 Q_ssr-->ssr
 # fix_csv_qssr.py
-import pandas as pd
-import os
+# import pandas as pd
+# import os
 
-DATA_DIR = "/data"
-files = [f for f in os.listdir(DATA_DIR) 
-         if f.startswith("pythia_") and f.endswith(".csv")]
+# DATA_DIR = "/data"
+# files = [f for f in os.listdir(DATA_DIR) 
+#          if f.startswith("pythia_") and f.endswith(".csv")]
 
-for fname in files:
-    fpath = os.path.join(DATA_DIR, fname)
-    df = pd.read_csv(fpath)
-    if "Q_ssr" in df.columns:
-        df = df.rename(columns={"Q_ssr": "ssr"})
-        df.to_csv(fpath, index=False)
-        print(f"Fixed: {fname}")
-    else:
-        print(f"Skip: {fname} (no Q_ssr column)")
+# for fname in files:
+#     fpath = os.path.join(DATA_DIR, fname)
+#     df = pd.read_csv(fpath)
+#     if "Q_ssr" in df.columns:
+#         df = df.rename(columns={"Q_ssr": "ssr"})
+#         df.to_csv(fpath, index=False)
+#         print(f"Fixed: {fname}")
+#     else:
+#         print(f"Skip: {fname} (no Q_ssr column)")
 
 # ── 启动时初始化数据库 ────────────────────────
 init_db()
