@@ -15,9 +15,28 @@ from ui.tab_tables import build_tab_tables
 from ui.tab_pythia import build_tab_pythia
 
 # 临时：删除错误的2.8b数据，跑一次后删掉这两行
+# import os
+# _bad = "/data/pythia_2.8b_ssr_20260603_111813.csv"
+# if os.path.exists(_bad): os.remove(_bad)
+
+# # 临时修改csv字段 Q_ssr-->ssr
+# fix_csv_qssr.py
+import pandas as pd
 import os
-_bad = "/data/pythia_2.8b_ssr_20260603_111813.csv"
-if os.path.exists(_bad): os.remove(_bad)
+
+DATA_DIR = "/data"
+files = [f for f in os.listdir(DATA_DIR) 
+         if f.startswith("pythia_") and f.endswith(".csv")]
+
+for fname in files:
+    fpath = os.path.join(DATA_DIR, fname)
+    df = pd.read_csv(fpath)
+    if "Q_ssr" in df.columns:
+        df = df.rename(columns={"Q_ssr": "ssr"})
+        df.to_csv(fpath, index=False)
+        print(f"Fixed: {fname}")
+    else:
+        print(f"Skip: {fname} (no Q_ssr column)")
 
 # ── 启动时初始化数据库 ────────────────────────
 init_db()

@@ -20,7 +20,7 @@ Pythia checkpoint SSR/UniIso 动态扫描
 CSV 字段：
   run_ts, model, step, layer, head,
   Q_eff_rank, Q_uni_iso, Q_theory_uniiso, Q_gap,
-  Q_ssr, Q_sv_entropy, Q_sv_max_ratio, Q_sv1, Q_sv2, Q_sv3,
+  ssr, Q_sv_entropy, Q_sv_max_ratio, Q_sv1, Q_sv2, Q_sv3,
   K_eff_rank, K_uni_iso, K_sv_entropy
 """
 
@@ -42,6 +42,7 @@ PYTHIA_CONFIGS = {
         "n_heads":   12,
         "d_model":   768,
         "d_head":    64,
+        "sharded":   False,
     },
     "410m": {
         "model_id": "EleutherAI/pythia-410m",
@@ -49,30 +50,33 @@ PYTHIA_CONFIGS = {
         "n_heads":   16,
         "d_model":   1024,
         "d_head":    64,
+        "sharded":   False,
     },
     "1b": {
         "model_id": "EleutherAI/pythia-1b",
-        "n_layers": 16,
-        "n_heads": 8,
-        "d_model": 2048,
-        "d_head": 256,
+        "n_layers":  16,
+        "n_heads":   8,
+        "d_model":   2048,
+        "d_head":    256,
+        "sharded":   False,
     },
     "1.4b": {
         "model_id": "EleutherAI/pythia-1.4b",
-        "n_layers": 24,
-        "n_heads": 16,
-        "d_model": 2048,
-        "d_head": 128,
+        "n_layers":  24,
+        "n_heads":   16,
+        "d_model":   2048,
+        "d_head":    128,
+        "sharded":   True,   # 只有分片，无model.safetensors
     },
     "2.8b": {
         "model_id": "EleutherAI/pythia-2.8b",
-        "n_layers": 32,
-        "n_heads": 32,
-        "d_model": 2560,
-        "d_head": 80,
+        "n_layers":  32,
+        "n_heads":   32,
+        "d_model":   2560,
+        "d_head":    80,
+        "sharded":   False,  # 有model.safetensors单文件，直接用
     },
 }
-
 # log-spaced 早期 + 等间距中后期，共 20 个 checkpoint
 DEFAULT_STEPS = [
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
@@ -182,22 +186,38 @@ def scan_checkpoint(model_id: str, step: int, cfg: dict, token: str = None) -> l
     d_head   = cfg["d_head"]
     d_model  = cfg["d_model"]
 
-    url = get_checkpoint_urls(model_id, step)
-    dprint(f"[SCAN] step={step}  url={url}")
-
-    # 读 header
-    header, header_size = read_safetensors_header(url, token=token)
-
     # 构造所有层的 QKV weight key
-    # Pythia weight key: gpt_neox.layers.{l}.attention.query_key_value.weight
-    # shape: [3*d_model, d_model] = [2304, 768] for 160m
     qkv_keys = [
         f"gpt_neox.layers.{l}.attention.query_key_value.weight"
         for l in range(n_layers)
     ]
 
-    # 一次 Range Request 读取所有层
-    tensors = load_tensors_batch(url, qkv_keys, header, header_size, token=token)
+    # 读权重（单文件 or 分片）
+    all_tensors = {}
+    if cfg.get("sharded", False):
+        import requests as _req
+        idx_url = (f"https://huggingface.co/{model_id}"
+                   f"/resolve/step{step}/model.safetensors.index.json")
+        wmap = _req.get(idx_url, timeout=30).json()["weight_map"]
+        shard_to_keys = {}
+        for k in qkv_keys:
+            shard = wmap.get(k)
+            if shard:
+                shard_to_keys.setdefault(shard, []).append(k)
+        for shard_name, keys in shard_to_keys.items():
+            url = (f"https://huggingface.co/{model_id}"
+                   f"/resolve/step{step}/{shard_name}")
+            header, header_size = read_safetensors_header(url, token=token)
+            t = load_tensors_batch(url, keys, header, header_size, token=token)
+            all_tensors.update(t)
+    else:
+        url = (f"https://huggingface.co/{model_id}"
+               f"/resolve/step{step}/model.safetensors")
+        dprint(f"[SCAN] step={step}  url={url}")
+        header, header_size = read_safetensors_header(url, token=token)
+        all_tensors = load_tensors_batch(
+            url, qkv_keys, header, header_size, token=token)
+    tensors = all_tensors
 
     records = []
     for layer in range(n_layers):
@@ -227,7 +247,7 @@ def scan_checkpoint(model_id: str, step: int, cfg: dict, token: str = None) -> l
             q_uni_iso   = uni_iso(Wq)
             q_theory    = theory_uniiso(d_head, q_eff_rank)
             q_gap       = q_uni_iso - q_theory
-            q_ssr       = compute_ssr(sq, sk)
+            ssr       = compute_ssr(sq, sk)
             q_sv_ent    = sv_entropy(sq)
             q_sv_maxr   = float(sq[0] / (sq[1] + 1e-12))
 
@@ -243,7 +263,7 @@ def scan_checkpoint(model_id: str, step: int, cfg: dict, token: str = None) -> l
                 "Q_uni_iso":        round(q_uni_iso, 6),
                 "Q_theory_uniiso":  round(q_theory,  6),
                 "Q_gap":            round(q_gap,     6),
-                "Q_ssr":            round(q_ssr,     8),
+                "ssr":              round(ssr,     8),
                 "Q_sv_entropy":     round(q_sv_ent,  4),
                 "Q_sv_max_ratio":   round(q_sv_maxr, 4),
                 "Q_sv1":            round(float(sq[0]), 4),
@@ -281,7 +301,7 @@ def load_done_steps(csv_path: str) -> set:
 CSV_FIELDS = [
     "run_ts", "model", "step", "layer", "head",
     "Q_eff_rank", "Q_uni_iso", "Q_theory_uniiso", "Q_gap",
-    "Q_ssr", "Q_sv_entropy", "Q_sv_max_ratio",
+    "ssr", "Q_sv_entropy", "Q_sv_max_ratio",
     "Q_sv1", "Q_sv2", "Q_sv3",
     "K_eff_rank", "K_uni_iso", "K_sv_entropy",
 ]
@@ -371,11 +391,11 @@ def scan_pythia(
                 pb = df_step.groupby("layer")["Q_uni_iso"].median()
                 ui_med  = float(pb.median())
                 rk_med  = float(df_step.groupby("layer")["Q_eff_rank"].median().median())
-                ssr_med = float(df_step.groupby("layer")["Q_ssr"].median().median())
+                ssr_med = float(df_step.groupby("layer")["ssr"].median().median())
                 print(f"[SCAN]   {n_heads_total} heads  "
                       f"Q_uni_iso(pb_med)={ui_med:.4f}  "
                       f"Q_eff_rank(pb_med)={rk_med:.1f}  "
-                      f"Q_ssr(pb_med)={ssr_med:.6f}  "
+                      f"ssr(pb_med)={ssr_med:.6f}  "
                       f"耗时={elapsed:.1f}s", flush=True)
 
             if progress_fn:

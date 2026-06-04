@@ -23,7 +23,7 @@ from core.pythia_scanner import scan_pythia, DEFAULT_STEPS, PYTHIA_CONFIGS, DATA
 METRICS = {
     "Q_uni_iso":       "UniIso (Q)",
     "Q_eff_rank":      "eff_rank (Q)",
-    "Q_ssr":           "SSR (Q vs K)",
+    "ssr":           "SSR (Q vs K)",
     "Q_sv_max_ratio":  "sv_max_ratio σ₁/σ₂ (Q)",
     "Q_sv_entropy":    "sv_entropy (Q)",
     "K_uni_iso":       "UniIso (K)",
