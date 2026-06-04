@@ -15,9 +15,9 @@ from ui.tab_tables import build_tab_tables
 from ui.tab_pythia import build_tab_pythia
 
 # 临时：删除错误的2.8b数据，跑一次后删掉这两行
-# import os
-# _bad = "/data/pythia_2.8b_ssr_20260603_111813.csv"
-# if os.path.exists(_bad): os.remove(_bad)
+import os
+_bad = "/data/pythia_2.8b_ssr_20260604_004549.csv"
+if os.path.exists(_bad): os.remove(_bad)
 
 # # 临时修改csv字段 Q_ssr-->ssr
 # fix_csv_qssr.py
