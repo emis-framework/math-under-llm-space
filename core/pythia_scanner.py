@@ -74,7 +74,7 @@ PYTHIA_CONFIGS = {
         "n_heads":   32,
         "d_model":   2560,
         "d_head":    80,
-        "sharded":   False,  # 有model.safetensors单文件，直接用
+        "sharded":   True,  # 有model.safetensors单文件，直接用
     },
 }
 # log-spaced 早期 + 等间距中后期，共 20 个 checkpoint
@@ -220,7 +220,7 @@ def scan_checkpoint(model_id: str, step: int, cfg: dict, token: str = None) -> l
             url, qkv_keys, header, header_size, token=token)
     tensors = all_tensors
     # DEBUG
-    for _l in [0, 1, 2, 1000]:
+    for _l in [0, 1, 2]:
         _key = f"gpt_neox.layers.{_l}.attention.query_key_value.weight"
         if _key in tensors:
             _w = tensors[_key].numpy()
