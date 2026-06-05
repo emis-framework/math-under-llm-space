@@ -213,6 +213,7 @@ def scan_checkpoint(model_id: str, step: int, cfg: dict, token: str = None) -> l
     else:
         url = (f"https://huggingface.co/{model_id}"
                f"/resolve/step{step}/model.safetensors")
+        print(f"[URL_DEBUG] url={url}", flush=True)  # 加这行
         dprint(f"[SCAN] step={step}  url={url}")
         header, header_size = read_safetensors_header(url, token=token)
         all_tensors = load_tensors_batch(
