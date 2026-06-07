@@ -194,8 +194,15 @@ def scan_checkpoint(model_id: str, step: int, cfg: dict, token: str = None) -> l
 
     # 读权重（单文件 or 分片）
     all_tensors = {}
-    if cfg.get("sharded", False):
-        import requests as _req
+    # 动态检测：该step是否有分片文件
+    import requests as _req
+    shard_url = (f"https://huggingface.co/{model_id}"
+                 f"/resolve/step{step}/model-00001-of-00002.safetensors")
+    r_check = _req.head(shard_url, timeout=15, allow_redirects=True)
+    use_sharded = (r_check.status_code == 200)
+    print(f"[SCAN] step={step} use_sharded={use_sharded}", flush=True)
+
+    if use_sharded:
         idx_url = (f"https://huggingface.co/{model_id}"
                    f"/resolve/step{step}/model.safetensors.index.json")
         wmap = _req.get(idx_url, timeout=30).json()["weight_map"]
@@ -213,27 +220,11 @@ def scan_checkpoint(model_id: str, step: int, cfg: dict, token: str = None) -> l
     else:
         url = (f"https://huggingface.co/{model_id}"
                f"/resolve/step{step}/model.safetensors")
-        print(f"[URL_DEBUG] url={url}", flush=True)  # 加这行
-        dprint(f"[SCAN] step={step}  url={url}")
+        # print(f"[URL_DEBUG] url={url}", flush=True)
         header, header_size = read_safetensors_header(url, token=token)
         all_tensors = load_tensors_batch(
             url, qkv_keys, header, header_size, token=token)
     tensors = all_tensors
-    # DEBUG
-    for _l in [0, 1, 2]:
-        _key = f"gpt_neox.layers.{_l}.attention.query_key_value.weight"
-        if _key in tensors:
-            _w = tensors[_key].numpy()
-            print(f"[SCAN_DEBUG] layer{_l} shape={_w.shape} mean={_w.mean():.6f} sample={float(_w[0,0]):.6f}", flush=True)
-        else:
-            print(f"[SCAN_DEBUG] layer{_l} NOT IN tensors", flush=True)
-
-    # 临时debug，确认后删除
-    for _l in [0, 1, 2]:
-        _key = f"gpt_neox.layers.{_l}.attention.query_key_value.weight"
-        if _key in tensors:
-            _w = tensors[_key].numpy()
-            dprint(f"[DEBUG] layer{_l} shape={_w.shape} mean={_w.mean():.6f} std={_w.std():.6f} sample={_w[0,0]:.6f}")    
 
     records = []
     for layer in range(n_layers):
