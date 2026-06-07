@@ -150,7 +150,7 @@ def load_latest_csv(model_size: str) -> pd.DataFrame:
 # ── Gradio Tab ─────────────────────────────────────────────────────────────────
 
 def build_tab_pythia():
-    with gr.Tab("📈 Pythia Training Dynamics"):
+    with gr.Tab("📈 Pythia"):
         gr.Markdown("""
 ### Pythia Checkpoint Scan
 扫描 [EleutherAI/pythia](https://huggingface.co/EleutherAI) 训练过程中的 attention 矩阵谱指标。
