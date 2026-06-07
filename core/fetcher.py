@@ -360,7 +360,7 @@ def load_tensors_batch(
 
         result[name] = t.reshape(shape).float()
         # DEBUG
-        print(f"[BATCH_DEBUG] {name} shape={result[name].shape} mean={result[name].mean():.6f} sample={float(result[name][0,0]):.6f}", flush=True)
+        # print(f"[BATCH_DEBUG] {name} shape={result[name].shape} mean={result[name].mean():.6f} sample={float(result[name][0,0]):.6f}", flush=True)
         dprint(f"[BATCH]   {name} {list(shape)} OK")
 
     return result
