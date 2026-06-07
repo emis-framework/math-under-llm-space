@@ -163,7 +163,7 @@ def load_latest_csv() -> pd.DataFrame:
 # ── Gradio Tab ─────────────────────────────────────────────────────────────────
 
 def build_tab_olmoe():
-    with gr.Tab("🧠 OLMoE Training Dynamics"):
+    with gr.Tab("🧠 OLMoE"):
         gr.Markdown("""
 ### OLMoE-1B-7B Checkpoint Scan
 扫描 [allenai/OLMoE-1B-7B-0924](https://huggingface.co/allenai/OLMoE-1B-7B-0924) 
