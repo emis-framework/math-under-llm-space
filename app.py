@@ -13,6 +13,7 @@ from ui.tab_database import build_tab_database
 from ui.tab_plot import build_tab_plot
 from ui.tab_tables import build_tab_tables
 from ui.tab_pythia import build_tab_pythia
+from ui.tab_olmoe import build_tab_olmoe
 
 # 临时：删除错误的2.8b数据，跑一次后删掉这两行
 import os
@@ -93,6 +94,7 @@ with gr.Blocks(
         build_tab_plot()
         build_tab_tables()
         build_tab_pythia()
+        build_tab_olmoe()
 
     # ── Tab1 → Tab2 联动 ──────────────────────
     inspect_model_id.change(
