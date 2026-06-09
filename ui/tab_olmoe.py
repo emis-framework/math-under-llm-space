@@ -23,10 +23,10 @@ from core.olmoe_scanner import (
 
 # ── grokking区间（来自arxiv 2506.21551）────────────────────────────────────────
 # 单位：tokens（B）
+# 改为：
 GROKKING_REGIONS = {
-    "Common sense":  (210,  420,  "#2166AC"),   # step50K-100K
-    "Code":          (420,  840,  "#D6604D"),   # step100K-200K
-    "Math":          (840,  1680, "#762A83"),   # step200K-400K
+    "Grokking region\n(3/4 domains acc>0.9,\narxiv 2506.21551)":
+        (2580, 4110, "#2166AC"),
 }
 
 # ── 指标映射 ───────────────────────────────────────────────────────────────────
@@ -169,7 +169,9 @@ def build_tab_olmoe():
 扫描 [allenai/OLMoE-1B-7B-0924](https://huggingface.co/allenai/OLMoE-1B-7B-0924) 
 训练过程中的 attention 矩阵谱指标。
 
-阴影区域标注来自 **arxiv 2506.21551** 的 grokking 时间窗口。
+阴影区域：step615k-980k（2580B-4110B tokens），3/4 domain benchmark acc>0.9，
+来自 **arxiv 2506.21551** Figure 1。
+Grokking定义：LoRA微调后benchmark accuracy > 0.9，作为val_acc的代理指标。                                        
 > 数据持久化至 `/data/olmoe_OLMoE-1B-7B-0924_ssr_{ts}.csv`，支持断点续跑。
         """)
 
@@ -181,7 +183,7 @@ def build_tab_olmoe():
             )
             cb_grok = gr.Checkbox(
                 value=True,
-                label="显示grokking区间（arxiv 2506.21551）",
+                label="显示grokking区间（step615k-980k，3/4 domain acc>0.9，arxiv 2506.21551）",
             )
             btn_scan = gr.Button("🚀 Run Scan", variant="primary")
             btn_load = gr.Button("📂 Load Existing CSV")

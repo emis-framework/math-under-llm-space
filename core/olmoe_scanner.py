@@ -46,6 +46,12 @@ OLMOE_CONFIGS = {
     },
 }
 
+# 删除原来的GROKKING_REGIONS（如果有）
+# 新增：
+GROKKING_THRESHOLD_STEP   = 980000        # step980k，3/4 domain acc>0.9
+GROKKING_THRESHOLD_TOKENS = 4110          # 对应4110B tokens
+GROKKING_START_TOKENS     = 2580          # step615k，benchmark acc开始回升
+
 DATA_DIR = "/data"
 ENERGY_THRESHOLD = 0.90
 
